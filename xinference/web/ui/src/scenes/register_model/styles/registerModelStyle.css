@@ -51,7 +51,20 @@
   overflow: hidden;
 }
 
+.checkboxWrapper {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  width: 100%;
+}
+
 .jsonBox-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.jsonBox-title {
   line-height: 40px;
   font-weight: 700;
 }
@@ -64,19 +77,6 @@
   border-radius: 5px;
   resize: none;
   color: #444;
-}
-
-.copyIcon {
-  cursor: pointer;
-  position: absolute;
-  top: 13px;
-  right: 5px;
-  font-size: 16px !important;
-  color: #555;
-}
-
-.copyIcon:hover {
-  color: #1976d2;
 }
 
 .addBtn {
@@ -118,4 +118,40 @@
 .deleteIcon {
   font-size: 28px !important;
   color: #fff;
+}
+
+.chat_template_box {
+  display: flex;
+  align-items: start;
+  gap: 10px;
+}
+
+.chat_template_test {
+  width: 30%;
+}
+
+.chat_template_test_mainBox {
+  height: 137px;
+  padding: 10px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  overflow: scroll;
+}
+
+.chat_template_test_tip {
+  font-size: 10px;
+  margin: 4px 14px 0;
+  color: rgba(0, 0, 0, 0.6);
+}
+
+.test_res_box {
+  background-color: #eee;
+  min-height: 55px;
+  padding: 10px;
+  margin-top: 5px;
+  border-radius: 4px;
+}
+
+.css-19qh8xo-MuiInputBase-input-MuiOutlinedInput-input.Mui-disabled {
+  -webkit-text-fill-color: #000 !important;
 }

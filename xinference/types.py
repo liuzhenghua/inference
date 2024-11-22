@@ -24,11 +24,8 @@ from ._compat import (
 )
 from .fields import (
     echo_field,
-    frequency_penalty_field,
-    logprobs_field,
     max_tokens_field,
     none_field,
-    presence_penalty_field,
     repeat_penalty_field,
     stop_field,
     stream_field,
@@ -39,8 +36,6 @@ from .fields import (
     top_p_field,
 )
 
-SPECIAL_TOOL_PROMPT = "<TOOL>"
-
 
 class Image(TypedDict):
     url: Optional[str]
@@ -50,6 +45,22 @@ class Image(TypedDict):
 class ImageList(TypedDict):
     created: int
     data: List[Image]
+
+
+class SDAPIResult(TypedDict):
+    images: List[str]
+    parameters: dict
+    info: dict
+
+
+class Video(TypedDict):
+    url: Optional[str]
+    b64_json: Optional[str]
+
+
+class VideoList(TypedDict):
+    created: int
+    data: List[Video]
 
 
 class EmbeddingUsage(TypedDict):
@@ -80,9 +91,37 @@ class DocumentObj(TypedDict):
     document: Optional[Document]
 
 
+# Cohere API compatibility
+class ApiVersion(TypedDict):
+    version: str
+    is_deprecated: bool
+    is_experimental: bool
+
+
+# Cohere API compatibility
+class BilledUnit(TypedDict):
+    input_tokens: int
+    output_tokens: int
+    search_units: int
+    classifications: int
+
+
+class RerankTokens(TypedDict):
+    input_tokens: int
+    output_tokens: int
+
+
+class Meta(TypedDict):
+    api_version: Optional[ApiVersion]
+    billed_units: Optional[BilledUnit]
+    tokens: RerankTokens
+    warnings: Optional[List[str]]
+
+
 class Rerank(TypedDict):
     id: str
     results: List[DocumentObj]
+    meta: Meta
 
 
 class CompletionLogprobs(TypedDict):
@@ -104,7 +143,7 @@ class ToolCalls(TypedDict):
 
 
 class CompletionChoice(TypedDict):
-    text: str
+    text: NotRequired[str]
     index: int
     logprobs: Optional[CompletionLogprobs]
     finish_reason: Optional[str]
@@ -178,30 +217,6 @@ class ChatCompletionChunk(TypedDict):
     usage: NotRequired[CompletionUsage]
 
 
-class ChatglmCppModelConfig(TypedDict, total=False):
-    pass
-
-
-class ChatglmCppGenerateConfig(TypedDict, total=False):
-    max_tokens: int
-    top_p: float
-    temperature: float
-    stream: bool
-    lora_name: Optional[str]
-    stream_options: Optional[Union[dict, None]]
-
-
-class QWenCppModelConfig(TypedDict, total=False):
-    pass
-
-
-class QWenCppGenerateConfig(TypedDict, total=False):
-    max_tokens: int
-    top_p: float
-    temperature: float
-    stream: bool
-
-
 StoppingCriteria = Callable[[List[int], List[float]], bool]
 
 
@@ -257,7 +272,6 @@ class LlamaCppModelConfig(TypedDict, total=False):
     vocab_only: bool
     use_mmap: bool
     use_mlock: bool
-    embedding: bool
     n_threads: Optional[int]
     n_batch: int
     last_n_tokens_size: int
@@ -299,6 +313,7 @@ class PytorchModelConfig(TypedDict, total=False):
     gptq_act_order: bool
     trust_remote_code: bool
     max_num_seqs: int
+    enable_tensorizer: Optional[bool]
 
 
 def get_pydantic_model_from_method(
@@ -388,41 +403,12 @@ except ImportError:
 CreateCompletionOpenAI: BaseModel
 
 
-class _CreateCompletionOpenAIFallback(BaseModel):
-    # OpenAI's create completion request body, we define it by pydantic
-    # model to verify the input params.
-    # https://platform.openai.com/docs/api-reference/completions/object
-    model: str
-    prompt: str
-    best_of: Optional[int] = 1
-    echo: bool = echo_field
-    frequency_penalty: Optional[float] = frequency_penalty_field
-    logit_bias: Optional[Dict[str, float]] = none_field
-    logprobs: Optional[int] = logprobs_field
-    max_tokens: int = max_tokens_field
-    n: Optional[int] = 1
-    presence_penalty: Optional[float] = presence_penalty_field
-    seed: Optional[int] = none_field
-    stop: Optional[Union[str, List[str]]] = stop_field
-    stream: bool = stream_field
-    stream_options: Optional[Union[dict, None]] = stream_option_field
-    suffix: Optional[str] = none_field
-    temperature: float = temperature_field
-    top_p: float = top_p_field
-    user: Optional[str] = none_field
+from openai.types.completion_create_params import CompletionCreateParamsNonStreaming
 
-
-try:
-    # For openai > 1
-    from openai.types.completion_create_params import CompletionCreateParamsNonStreaming
-
-    CreateCompletionOpenAI = create_model_from_typeddict(
-        CompletionCreateParamsNonStreaming,
-    )
-    CreateCompletionOpenAI = fix_forward_ref(CreateCompletionOpenAI)
-except ImportError:
-    # TODO(codingl2k1): Remove it if openai < 1 is dropped.
-    CreateCompletionOpenAI = _CreateCompletionOpenAIFallback
+CreateCompletionOpenAI = create_model_from_typeddict(
+    CompletionCreateParamsNonStreaming,
+)
+CreateCompletionOpenAI = fix_forward_ref(CreateCompletionOpenAI)
 
 
 class CreateCompletion(
@@ -442,22 +428,11 @@ class CreateChatModel(BaseModel):
 CreateChatCompletionTorch = CreateCompletionTorch
 CreateChatCompletionLlamaCpp: BaseModel = CreateCompletionLlamaCpp
 
-# This type is for openai API compatibility
-CreateChatCompletionOpenAI: BaseModel
+
+from ._compat import CreateChatCompletionOpenAI
 
 
-# Only support openai > 1
-from openai.types.chat.completion_create_params import (
-    CompletionCreateParamsNonStreaming,
-)
-
-CreateChatCompletionOpenAI = create_model_from_typeddict(
-    CompletionCreateParamsNonStreaming,
-)
-CreateChatCompletionOpenAI = fix_forward_ref(CreateChatCompletionOpenAI)
-
-
-class CreateChatCompletion(
+class CreateChatCompletion(  # type: ignore
     CreateChatModel,
     CreateChatCompletionTorch,
     CreateChatCompletionLlamaCpp,

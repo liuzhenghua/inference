@@ -11,19 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import collections.abc
 import logging
 import os
+import platform
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 from ...constants import XINFERENCE_CACHE_DIR
 from ...types import PeftModelConfig
 from ..core import CacheableModelSpec, ModelDescription
 from ..utils import valid_model_revision
+from .ocr.got_ocr2 import GotOCR2Model
 from .stable_diffusion.core import DiffusionModel
-
-MAX_ATTEMPTS = 3
+from .stable_diffusion.mlx import MLXDiffusionModel
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +47,10 @@ class ImageModelFamilyV1(CacheableModelSpec):
     model_id: str
     model_revision: str
     model_hub: str = "huggingface"
+    model_ability: Optional[List[str]]
     controlnet: Optional[List["ImageModelFamilyV1"]]
+    default_model_config: Optional[dict] = {}
+    default_generate_config: Optional[dict] = {}
 
 
 class ImageModelDescription(ModelDescription):
@@ -71,6 +76,7 @@ class ImageModelDescription(ModelDescription):
             "model_name": self._model_spec.model_name,
             "model_family": self._model_spec.model_family,
             "model_revision": self._model_spec.model_revision,
+            "model_ability": self._model_spec.model_ability,
             "controlnet": controlnet,
         }
 
@@ -117,7 +123,12 @@ def generate_image_description(
     return res
 
 
-def match_diffusion(model_name: str) -> ImageModelFamilyV1:
+def match_diffusion(
+    model_name: str,
+    download_hub: Optional[
+        Literal["huggingface", "modelscope", "openmind_hub", "csghub"]
+    ] = None,
+) -> ImageModelFamilyV1:
     from ..utils import download_from_modelscope
     from . import BUILTIN_IMAGE_MODELS, MODELSCOPE_IMAGE_MODELS
     from .custom import get_user_defined_images
@@ -126,17 +137,17 @@ def match_diffusion(model_name: str) -> ImageModelFamilyV1:
         if model_spec.model_name == model_name:
             return model_spec
 
-    if download_from_modelscope():
-        if model_name in MODELSCOPE_IMAGE_MODELS:
-            logger.debug(f"Image model {model_name} found in ModelScope.")
-            return MODELSCOPE_IMAGE_MODELS[model_name]
-        else:
-            logger.debug(
-                f"Image model {model_name} not found in ModelScope, "
-                f"now try to load it via builtin way."
-            )
-
-    if model_name in BUILTIN_IMAGE_MODELS:
+    if download_hub == "modelscope" and model_name in MODELSCOPE_IMAGE_MODELS:
+        logger.debug(f"Image model {model_name} found in ModelScope.")
+        return MODELSCOPE_IMAGE_MODELS[model_name]
+    elif download_hub == "huggingface" and model_name in BUILTIN_IMAGE_MODELS:
+        logger.debug(f"Image model {model_name} found in Huggingface.")
+        return BUILTIN_IMAGE_MODELS[model_name]
+    elif download_from_modelscope() and model_name in MODELSCOPE_IMAGE_MODELS:
+        logger.debug(f"Image model {model_name} found in ModelScope.")
+        return MODELSCOPE_IMAGE_MODELS[model_name]
+    elif model_name in BUILTIN_IMAGE_MODELS:
+        logger.debug(f"Image model {model_name} found in Huggingface.")
         return BUILTIN_IMAGE_MODELS[model_name]
     else:
         raise ValueError(
@@ -173,8 +184,29 @@ def get_cache_status(
             ]
         )
     else:  # Usually for UT
-        logger.warning(f"Cannot find builtin image model spec: {model_name}")
         return valid_model_revision(meta_path, model_spec.model_revision)
+
+
+def create_ocr_model_instance(
+    subpool_addr: str,
+    devices: List[str],
+    model_uid: str,
+    model_spec: ImageModelFamilyV1,
+    model_path: Optional[str] = None,
+    **kwargs,
+) -> Tuple[GotOCR2Model, ImageModelDescription]:
+    if not model_path:
+        model_path = cache(model_spec)
+    model = GotOCR2Model(
+        model_uid,
+        model_path,
+        model_spec=model_spec,
+        **kwargs,
+    )
+    model_description = ImageModelDescription(
+        subpool_addr, devices, model_spec, model_path=model_path
+    )
+    return model, model_description
 
 
 def create_image_model_instance(
@@ -183,9 +215,31 @@ def create_image_model_instance(
     model_uid: str,
     model_name: str,
     peft_model_config: Optional[PeftModelConfig] = None,
+    download_hub: Optional[
+        Literal["huggingface", "modelscope", "openmind_hub", "csghub"]
+    ] = None,
+    model_path: Optional[str] = None,
     **kwargs,
-) -> Tuple[DiffusionModel, ImageModelDescription]:
-    model_spec = match_diffusion(model_name)
+) -> Tuple[
+    Union[DiffusionModel, MLXDiffusionModel, GotOCR2Model], ImageModelDescription
+]:
+    model_spec = match_diffusion(model_name, download_hub)
+    if model_spec.model_ability and "ocr" in model_spec.model_ability:
+        return create_ocr_model_instance(
+            subpool_addr=subpool_addr,
+            devices=devices,
+            model_uid=model_uid,
+            model_name=model_name,
+            model_spec=model_spec,
+            model_path=model_path,
+            **kwargs,
+        )
+
+    # use default model config
+    model_default_config = (model_spec.default_model_config or {}).copy()
+    model_default_config.update(kwargs)
+    kwargs = model_default_config
+
     controlnet = kwargs.get("controlnet")
     # Handle controlnet
     if controlnet is not None:
@@ -203,18 +257,21 @@ def create_image_model_instance(
         for name in controlnet:
             for cn_model_spec in model_spec.controlnet:
                 if cn_model_spec.model_name == name:
-                    model_path = cache(cn_model_spec)
-                    controlnet_model_paths.append(model_path)
+                    controlnet_model_path = cache(cn_model_spec)
+                    controlnet_model_paths.append(controlnet_model_path)
                     break
             else:
                 raise ValueError(
                     f"controlnet `{name}` is not supported for model `{model_name}`."
                 )
         if len(controlnet_model_paths) == 1:
-            kwargs["controlnet"] = controlnet_model_paths[0]
+            kwargs["controlnet"] = (controlnet[0], controlnet_model_paths[0])
         else:
-            kwargs["controlnet"] = controlnet_model_paths
-    model_path = cache(model_spec)
+            kwargs["controlnet"] = [
+                (n, path) for n, path in zip(controlnet, controlnet_model_paths)
+            ]
+    if not model_path:
+        model_path = cache(model_spec)
     if peft_model_config is not None:
         lora_model = peft_model_config.peft_model
         lora_load_kwargs = peft_model_config.image_lora_load_kwargs
@@ -224,12 +281,23 @@ def create_image_model_instance(
         lora_load_kwargs = None
         lora_fuse_kwargs = None
 
-    model = DiffusionModel(
+    if (
+        platform.system() == "Darwin"
+        and "arm" in platform.machine().lower()
+        and model_name in MLXDiffusionModel.supported_models
+    ):
+        # Mac with M series silicon chips
+        model_cls = MLXDiffusionModel
+    else:
+        model_cls = DiffusionModel  # type: ignore
+
+    model = model_cls(
         model_uid,
         model_path,
-        lora_model_paths=lora_model,
+        lora_model=lora_model,
         lora_load_kwargs=lora_load_kwargs,
         lora_fuse_kwargs=lora_fuse_kwargs,
+        model_spec=model_spec,
         **kwargs,
     )
     model_description = ImageModelDescription(

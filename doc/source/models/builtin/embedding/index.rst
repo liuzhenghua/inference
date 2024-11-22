@@ -45,11 +45,15 @@ The following is a list of built-in embedding models in Xinference:
   
    gte-large
   
+   gte-qwen2
+  
    jina-embeddings-v2-base-en
   
    jina-embeddings-v2-base-zh
   
    jina-embeddings-v2-small-en
+  
+   jina-embeddings-v3
   
    m3e-base
   

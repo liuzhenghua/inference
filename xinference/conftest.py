@@ -58,10 +58,6 @@ TEST_LOGGING_CONF = {
             "propagate": False,
         }
     },
-    "root": {
-        "level": "WARN",
-        "handlers": ["stream_handler"],
-    },
 }
 
 TEST_LOG_FILE_PATH = get_log_file(f"test_{get_timestamp_ms()}")
@@ -102,10 +98,6 @@ TEST_FILE_LOGGING_CONF = {
             "propagate": False,
         }
     },
-    "root": {
-        "level": "WARN",
-        "handlers": ["stream_handler", "file_handler"],
-    },
 }
 
 
@@ -144,7 +136,7 @@ async def _start_test_cluster(
             address=f"test://{address}", logging_conf=logging_conf
         )
         await xo.create_actor(
-            SupervisorActor, address=address, uid=SupervisorActor.uid()
+            SupervisorActor, address=address, uid=SupervisorActor.default_uid()
         )
         await start_worker_components(
             address=address,
@@ -194,7 +186,7 @@ def setup():
     local_cluster_proc = run_test_cluster_in_subprocess(
         supervisor_addr, TEST_LOGGING_CONF
     )
-    if not cluster_health_check(supervisor_addr, max_attempts=10, sleep_interval=3):
+    if not cluster_health_check(supervisor_addr, max_attempts=10, sleep_interval=5):
         raise RuntimeError("Cluster is not available after multiple attempts")
 
     port = xo.utils.get_next_port()
@@ -226,7 +218,7 @@ def setup_with_file_logging():
     local_cluster_proc = run_test_cluster_in_subprocess(
         supervisor_addr, TEST_FILE_LOGGING_CONF
     )
-    if not cluster_health_check(supervisor_addr, max_attempts=3, sleep_interval=3):
+    if not cluster_health_check(supervisor_addr, max_attempts=10, sleep_interval=5):
         raise RuntimeError("Cluster is not available after multiple attempts")
 
     port = xo.utils.get_next_port()
@@ -258,7 +250,7 @@ def setup_with_auth():
     local_cluster_proc = run_test_cluster_in_subprocess(
         supervisor_addr, TEST_LOGGING_CONF
     )
-    if not cluster_health_check(supervisor_addr, max_attempts=10, sleep_interval=3):
+    if not cluster_health_check(supervisor_addr, max_attempts=10, sleep_interval=5):
         raise RuntimeError("Cluster is not available after multiple attempts")
 
     user1 = User(

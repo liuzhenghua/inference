@@ -23,3 +23,7 @@ The following is a list of built-in rerank models in Xinference:
   
    bge-reranker-v2-minicpm-layerwise
   
+   jina-reranker-v2
+  
+   minicpm-reranker
+  

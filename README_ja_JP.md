@@ -9,7 +9,11 @@
 [![Slack](https://img.shields.io/badge/join_Slack-781FF5.svg?logo=slack&style=for-the-badge)](https://join.slack.com/t/xorbitsio/shared_invite/zt-1o3z9ucdh-RbfhbPVpx7prOVdM1CAuxg)
 [![Twitter](https://img.shields.io/twitter/follow/xorbitsio?logo=x&style=for-the-badge)](https://twitter.com/xorbitsio)
 
-[English](README.md) | [中文介绍](README_zh_CN.md) | 日本語
+<p align="center">
+  <a href="./README.md"><img alt="README in English" src="https://img.shields.io/badge/English-d9d9d9?style=for-the-badge"></a>
+  <a href="./README_zh_CN.md"><img alt="简体中文版自述文件" src="https://img.shields.io/badge/中文介绍-d9d9d9?style=for-the-badge"></a>
+  <a href="./README_ja_JP.md"><img alt="日本語のREADME" src="https://img.shields.io/badge/日本語-454545?style=for-the-badge"></a>
+</p>
 </div>
 <br />
 
@@ -99,6 +103,24 @@ Xinferenceが実行されると、Web UI、cURL、コマンドライン、また
 | [Github イシュー](https://github.com/xorbitsai/inference/issues)                                  | バグ報告と機能リクエストの提出。                  |
 | [Slack](https://join.slack.com/t/xorbitsio/shared_invite/zt-1o3z9ucdh-RbfhbPVpx7prOVdM1CAuxg)      | 他のXorbitsユーザーとの協力。                      |
 | [Twitter](https://twitter.com/xorbitsio)                                                          | 新機能に関する最新情報の入手。                    |
+
+## 引用
+
+この仕事が役立つ場合は、以下のように引用してください：
+
+```bibtex
+@inproceedings{lu2024xinference,
+    title = "Xinference: Making Large Model Serving Easy",
+    author = "Lu, Weizheng and Xiong, Lingfeng and Zhang, Feng and Qin, Xuye and Chen, Yueguo",
+    booktitle = "Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing: System Demonstrations",
+    month = nov,
+    year = "2024",
+    address = "Miami, Florida, USA",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2024.emnlp-demo.30",
+    pages = "291--300",
+}
+```
 
 ## 寄稿者
 

@@ -11,62 +11,141 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
+import asyncio
 import logging
 import os
 import random
 import string
-from typing import Dict, Generator, List, Tuple, Union
+import uuid
+import weakref
+from enum import Enum
+from typing import Dict, Generator, List, Optional, Tuple, Union
 
 import orjson
 from pynvml import nvmlDeviceGetCount, nvmlInit, nvmlShutdown
 
 from .._compat import BaseModel
+from ..constants import (
+    XINFERENCE_DEFAULT_CANCEL_BLOCK_DURATION,
+    XINFERENCE_LOG_ARG_MAX_LENGTH,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def log_async(logger, args_formatter=None):
+class AbortRequestMessage(Enum):
+    NOT_FOUND = 1
+    DONE = 2
+    NO_OP = 3
+
+
+def truncate_log_arg(arg) -> str:
+    s = str(arg)
+    if len(s) > XINFERENCE_LOG_ARG_MAX_LENGTH:
+        s = s[0:XINFERENCE_LOG_ARG_MAX_LENGTH] + "..."
+    return s
+
+
+def log_async(
+    logger,
+    level=logging.DEBUG,
+    ignore_kwargs: Optional[List[str]] = None,
+    log_exception=True,
+):
     import time
     from functools import wraps
+    from inspect import signature
 
     def decorator(func):
+        func_name = func.__name__
+        sig = signature(func)
+
         @wraps(func)
         async def wrapped(*args, **kwargs):
-            if args_formatter is not None:
-                formatted_args, formatted_kwargs = copy.copy(args), copy.copy(kwargs)
-                args_formatter(formatted_args, formatted_kwargs)
-            else:
-                formatted_args, formatted_kwargs = args, kwargs
-            logger.debug(
-                f"Enter {func.__name__}, args: {formatted_args}, kwargs: {formatted_kwargs}"
+            try:
+                bound_args = sig.bind_partial(*args, **kwargs)
+                arguments = bound_args.arguments
+            except TypeError:
+                arguments = {}
+            request_id_str = arguments.get("request_id", "")
+            if not request_id_str:
+                request_id_str = uuid.uuid1()
+                if func_name == "text_to_image":
+                    kwargs["request_id"] = request_id_str
+            request_id_str = f"[request {request_id_str}]"
+            formatted_args = ",".join(map(truncate_log_arg, args))
+            formatted_kwargs = ",".join(
+                [
+                    "%s=%s" % (k, truncate_log_arg(v))
+                    for k, v in kwargs.items()
+                    if ignore_kwargs is None or k not in ignore_kwargs
+                ]
+            )
+            logger.log(
+                level,
+                f"{request_id_str} Enter {func_name}, args: {formatted_args}, kwargs: {formatted_kwargs}",
             )
             start = time.time()
-            ret = await func(*args, **kwargs)
-            logger.debug(
-                f"Leave {func.__name__}, elapsed time: {int(time.time() - start)} s"
-            )
-            return ret
+            try:
+                ret = await func(*args, **kwargs)
+                logger.log(
+                    level,
+                    f"{request_id_str} Leave {func_name}, elapsed time: {int(time.time() - start)} s",
+                )
+                return ret
+            except Exception as e:
+                if log_exception:
+                    logger.error(
+                        f"{request_id_str} Leave {func_name}, error: {e}, elapsed time: {int(time.time() - start)} s",
+                        exc_info=True,
+                    )
+                else:
+                    logger.log(
+                        level,
+                        f"{request_id_str} Leave {func_name}, error: {e}, elapsed time: {int(time.time() - start)} s",
+                    )
+                raise
 
         return wrapped
 
     return decorator
 
 
-def log_sync(logger):
+def log_sync(logger, level=logging.DEBUG, log_exception=True):
     import time
     from functools import wraps
 
     def decorator(func):
         @wraps(func)
         def wrapped(*args, **kwargs):
-            logger.debug(f"Enter {func.__name__}, args: {args}, kwargs: {kwargs}")
-            start = time.time()
-            ret = func(*args, **kwargs)
-            logger.debug(
-                f"Leave {func.__name__}, elapsed time: {int(time.time() - start)} s"
+            formatted_args = ",".join(map(truncate_log_arg, args))
+            formatted_kwargs = ",".join(
+                map(lambda x: "%s=%s" % (x[0], truncate_log_arg(x[1])), kwargs.items())
             )
-            return ret
+            logger.log(
+                level,
+                f"Enter {func.__name__}, args: {formatted_args}, kwargs: {formatted_kwargs}",
+            )
+            start = time.time()
+            try:
+                ret = func(*args, **kwargs)
+                logger.log(
+                    level,
+                    f"Leave {func.__name__}, elapsed time: {int(time.time() - start)} s",
+                )
+                return ret
+            except Exception as e:
+                if log_exception:
+                    logger.error(
+                        f"Leave {func.__name__}, error: {e}, elapsed time: {int(time.time() - start)} s",
+                        exc_info=True,
+                    )
+                else:
+                    logger.log(
+                        level,
+                        f"Leave {func.__name__}, error: {e}, elapsed time: {int(time.time() - start)} s",
+                    )
+                raise
 
         return wrapped
 
@@ -79,27 +158,26 @@ def iter_replica_model_uid(model_uid: str, replica: int) -> Generator[str, None,
     """
     replica = int(replica)
     for rep_id in range(replica):
-        yield f"{model_uid}-{replica}-{rep_id}"
+        yield f"{model_uid}-{rep_id}"
 
 
-def build_replica_model_uid(model_uid: str, replica: int, rep_id: int) -> str:
+def build_replica_model_uid(model_uid: str, rep_id: int) -> str:
     """
     Build a replica model uid.
     """
-    return f"{model_uid}-{replica}-{rep_id}"
+    return f"{model_uid}-{rep_id}"
 
 
-def parse_replica_model_uid(replica_model_uid: str) -> Tuple[str, int, int]:
+def parse_replica_model_uid(replica_model_uid: str) -> Tuple[str, int]:
     """
-    Parse replica model uid to model uid, replica and rep id.
+    Parse replica model uid to model uid and rep id.
     """
     parts = replica_model_uid.split("-")
     if len(parts) == 1:
-        return replica_model_uid, -1, -1
+        return replica_model_uid, -1
     rep_id = int(parts.pop())
-    replica = int(parts.pop())
     model_uid = "-".join(parts)
-    return model_uid, replica, rep_id
+    return model_uid, rep_id
 
 
 def is_valid_model_uid(model_uid: str) -> bool:
@@ -194,12 +272,65 @@ def get_nvidia_gpu_info() -> Dict:
 
 
 def assign_replica_gpu(
-    _replica_model_uid: str, gpu_idx: Union[int, List[int]]
+    _replica_model_uid: str, replica: int, gpu_idx: Union[int, List[int]]
 ) -> List[int]:
-    model_uid, replica, rep_id = parse_replica_model_uid(_replica_model_uid)
+    model_uid, rep_id = parse_replica_model_uid(_replica_model_uid)
     rep_id, replica = int(rep_id), int(replica)
     if isinstance(gpu_idx, int):
         gpu_idx = [gpu_idx]
     if isinstance(gpu_idx, list) and gpu_idx:
         return gpu_idx[rep_id::replica]
     return gpu_idx
+
+
+class CancelMixin:
+    _CANCEL_TASK_NAME = "abort_block"
+
+    def __init__(self):
+        self._running_tasks: weakref.WeakValueDictionary[
+            str, asyncio.Task
+        ] = weakref.WeakValueDictionary()
+
+    def _add_running_task(self, request_id: Optional[str]):
+        """Add current asyncio task to the running task.
+        :param request_id: The corresponding request id.
+        """
+        if request_id is None:
+            return
+        running_task = self._running_tasks.get(request_id)
+        if running_task is not None:
+            if running_task.get_name() == self._CANCEL_TASK_NAME:
+                raise Exception(f"The request has been aborted: {request_id}")
+            raise Exception(f"Duplicate request id: {request_id}")
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        self._running_tasks[request_id] = current_task
+
+    def _cancel_running_task(
+        self,
+        request_id: Optional[str],
+        block_duration: int = XINFERENCE_DEFAULT_CANCEL_BLOCK_DURATION,
+    ):
+        """Cancel the running asyncio task.
+        :param request_id: The request id to cancel.
+        :param block_duration: The duration seconds to ensure the request can't be executed.
+        """
+        if request_id is None:
+            return
+        running_task = self._running_tasks.pop(request_id, None)
+        if running_task is not None:
+            running_task.cancel()
+
+        async def block_task():
+            """This task is for blocking the request for a duration."""
+            try:
+                await asyncio.sleep(block_duration)
+                logger.info("Abort block end for request: %s", request_id)
+            except asyncio.CancelledError:
+                logger.info("Abort block is cancelled for request: %s", request_id)
+
+        if block_duration > 0:
+            logger.info("Abort block start for request: %s", request_id)
+            self._running_tasks[request_id] = asyncio.create_task(
+                block_task(), name=self._CANCEL_TASK_NAME
+            )

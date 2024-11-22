@@ -3,17 +3,17 @@ import './styles/modelCardStyle.css'
 import {
   ChatOutlined,
   Close,
+  Delete,
   EditNote,
   EditNoteOutlined,
   ExpandLess,
   ExpandMore,
+  Grade,
   HelpCenterOutlined,
   RocketLaunchOutlined,
+  StarBorder,
   UndoOutlined,
-  WarningAmber,
 } from '@mui/icons-material'
-import DeleteIcon from '@mui/icons-material/Delete'
-import FilterNoneIcon from '@mui/icons-material/FilterNone'
 import {
   Alert,
   Backdrop,
@@ -22,11 +22,6 @@ import {
   Chip,
   CircularProgress,
   Collapse,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogContentText,
-  DialogTitle,
   Drawer,
   FormControl,
   Grid,
@@ -50,14 +45,36 @@ import {
   Tooltip,
 } from '@mui/material'
 import { styled } from '@mui/material/styles'
-import ClipboardJS from 'clipboard'
 import React, { useContext, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { ApiContext } from '../../components/apiContext'
-import fetcher from '../../components/fetcher'
+import CopyComponent from '../../components/copyComponent/copyComponent'
+import DeleteDialog from '../../components/deleteDialog'
+import fetchWrapper from '../../components/fetchWrapper'
 import TitleTypography from '../../components/titleTypography'
 import AddPair from './components/addPair'
+
+const llmAllDataKey = [
+  'model_uid',
+  'model_name',
+  'model_type',
+  'model_engine',
+  'model_format',
+  'model_size_in_billions',
+  'quantization',
+  'n_gpu',
+  'n_gpu_layers',
+  'replica',
+  'request_limits',
+  'worker_ip',
+  'gpu_idx',
+  'download_hub',
+  'model_path',
+  'peft_model_config',
+]
+
+const csghubArr = ['qwen2-instruct']
 
 const ModelCard = ({
   url,
@@ -66,6 +83,8 @@ const ModelCard = ({
   modelType,
   is_custom = false,
   onHandleCompleteDelete,
+  onHandlecustomDelete,
+  onGetCollectionArr,
 }) => {
   const [hover, setHover] = useState(false)
   const [selected, setSelected] = useState(false)
@@ -74,6 +93,8 @@ const ModelCard = ({
   const [isOther, setIsOther] = useState(false)
   const [isPeftModelConfig, setIsPeftModelConfig] = useState(false)
   const [openSnackbar, setOpenSnackbar] = useState(false)
+  const [openErrorSnackbar, setOpenErrorSnackbar] = useState(false)
+  const [errorSnackbarValue, setErrorSnackbarValue] = useState('')
   const { isCallingApi, setIsCallingApi } = useContext(ApiContext)
   const { isUpdatingModel } = useContext(ApiContext)
   const { setErrorMsg } = useContext(ApiContext)
@@ -92,6 +113,8 @@ const ModelCard = ({
   const [requestLimits, setRequestLimits] = useState('')
   const [workerIp, setWorkerIp] = useState('')
   const [GPUIdx, setGPUIdx] = useState('')
+  const [downloadHub, setDownloadHub] = useState('')
+  const [modelPath, setModelPath] = useState('')
 
   const [enginesObj, setEnginesObj] = useState({})
   const [engineOptions, setEngineOptions] = useState([])
@@ -109,7 +132,14 @@ const ModelCard = ({
   const [cachedModelVersion, setCachedModelVersion] = useState('')
   const [cachedRealPath, setCachedRealPath] = useState('')
   const [page, setPage] = useState(0)
-  const [isCopySuccess, setIsCopySuccess] = useState(false)
+  const [isDeleteCustomModel, setIsDeleteCustomModel] = useState(false)
+  const [isJsonShow, setIsJsonShow] = useState(false)
+  const [isHistory, setIsHistory] = useState(false)
+  const [customArr, setCustomArr] = useState([])
+  const [loraArr, setLoraArr] = useState([])
+  const [imageLoraLoadArr, setImageLoraLoadArr] = useState([])
+  const [imageLoraFuseArr, setImageLoraFuseArr] = useState([])
+  const [customParametersArrLength, setCustomParametersArrLength] = useState(0)
 
   const parentRef = useRef(null)
 
@@ -118,10 +148,10 @@ const ModelCard = ({
   }
 
   const isCached = (spec) => {
-    if (spec.model_format === 'pytorch') {
-      return spec.cache_status && spec.cache_status === true
+    if (Array.isArray(spec.cache_status)) {
+      return spec.cache_status.some((cs) => cs)
     } else {
-      return spec.cache_status && spec.cache_status.some((cs) => cs)
+      return spec.cache_status === true
     }
   }
 
@@ -131,12 +161,24 @@ const ModelCard = ({
   }
 
   useEffect(() => {
-    setModelFormat('')
+    let keyArr = []
+    for (let key in enginesObj) {
+      keyArr.push(key)
+    }
+    if (keyArr.length) {
+      handleLlmHistory()
+    }
+  }, [enginesObj])
+
+  useEffect(() => {
     if (modelEngine) {
       const format = [
         ...new Set(enginesObj[modelEngine].map((item) => item.model_format)),
       ]
       setFormatOptions(format)
+      if (!isHistory || !format.includes(modelFormat)) {
+        setModelFormat('')
+      }
       if (format.length === 1) {
         setModelFormat(format[0])
       }
@@ -144,7 +186,6 @@ const ModelCard = ({
   }, [modelEngine])
 
   useEffect(() => {
-    setModelSize('')
     if (modelEngine && modelFormat) {
       const sizes = [
         ...new Set(
@@ -154,6 +195,13 @@ const ModelCard = ({
         ),
       ]
       setSizeOptions(sizes)
+      if (
+        !isHistory ||
+        (sizeOptions.length &&
+          JSON.stringify(sizes) !== JSON.stringify(sizeOptions))
+      ) {
+        setModelSize('')
+      }
       if (sizes.length === 1) {
         setModelSize(sizes[0])
       }
@@ -161,7 +209,6 @@ const ModelCard = ({
   }, [modelEngine, modelFormat])
 
   useEffect(() => {
-    setQuantization('')
     if (modelEngine && modelFormat && modelSize) {
       const quants = [
         ...new Set(
@@ -175,6 +222,9 @@ const ModelCard = ({
         ),
       ]
       setQuantizationOptions(quants)
+      if (!isHistory || !quants.includes(quantization)) {
+        setQuantization('')
+      }
       if (quants.length === 1) {
         setQuantization(quants[0])
       }
@@ -182,7 +232,11 @@ const ModelCard = ({
   }, [modelEngine, modelFormat, modelSize])
 
   useEffect(() => {
-    if (parentRef.current) {
+    setCustomParametersArrLength(customParametersArr.length)
+    if (
+      parentRef.current &&
+      customParametersArr.length > customParametersArrLength
+    ) {
       parentRef.current.scrollTo({
         top: parentRef.current.scrollHeight,
         behavior: 'smooth',
@@ -207,155 +261,148 @@ const ModelCard = ({
   }
 
   const getModelEngine = (model_name) => {
-    fetcher(url + `/v1/engines/${model_name}`, {
-      method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    })
-      .then((response) => {
-        if (!response.ok) {
-          // Assuming the server returns error details in JSON format
-          response.json().then((errorData) => {
-            setErrorMsg(
-              `Server error: ${response.status} - ${
-                errorData.detail || 'Unknown error'
-              }`
-            )
-          })
-        } else {
-          response.json().then((data) => {
-            setEnginesObj(data)
-            setEngineOptions(Object.keys(data))
-          })
-        }
+    fetchWrapper
+      .get(`/v1/engines/${model_name}`)
+      .then((data) => {
+        setEnginesObj(data)
+        setEngineOptions(Object.keys(data))
         setIsCallingApi(false)
       })
       .catch((error) => {
         console.error('Error:', error)
+        if (error.response.status !== 403) {
+          setErrorMsg(error.message)
+        }
         setIsCallingApi(false)
       })
   }
 
-  const launchModel = (url) => {
+  const launchModel = () => {
     if (isCallingApi || isUpdatingModel) {
       return
     }
 
     setIsCallingApi(true)
 
-    const modelDataWithID_LLM = {
-      // If user does not fill model_uid, pass null (None) to server and server generates it.
-      model_uid: modelUID.trim() === '' ? null : modelUID.trim(),
-      model_name: modelData.model_name,
-      model_type: modelType,
-      model_engine: modelEngine,
-      model_format: modelFormat,
-      model_size_in_billions: convertModelSize(modelSize),
-      quantization: quantization,
-      n_gpu:
-        parseInt(nGPU, 10) === 0 || nGPU === 'CPU'
-          ? null
-          : nGPU === 'auto'
-          ? 'auto'
-          : parseInt(nGPU, 10),
-      replica: replica,
-      request_limits:
-        requestLimits.trim() === '' ? null : Number(requestLimits.trim()),
-      worker_ip: workerIp.trim() === '' ? null : workerIp.trim(),
-      gpu_idx: GPUIdx.trim() === '' ? null : handleGPUIdx(GPUIdx.trim()),
-    }
+    try {
+      const modelDataWithID_LLM = {
+        // If user does not fill model_uid, pass null (None) to server and server generates it.
+        model_uid: modelUID?.trim() === '' ? null : modelUID?.trim(),
+        model_name: modelData.model_name,
+        model_type: modelType,
+        model_engine: modelEngine,
+        model_format: modelFormat,
+        model_size_in_billions: convertModelSize(modelSize),
+        quantization: quantization,
+        n_gpu:
+          parseInt(nGPU, 10) === 0 || nGPU === 'CPU'
+            ? null
+            : nGPU === 'auto'
+            ? 'auto'
+            : parseInt(nGPU, 10),
+        replica: replica,
+        request_limits:
+          String(requestLimits)?.trim() === ''
+            ? null
+            : Number(String(requestLimits)?.trim()),
+        worker_ip: workerIp?.trim() === '' ? null : workerIp?.trim(),
+        gpu_idx: GPUIdx?.trim() === '' ? null : handleGPUIdx(GPUIdx?.trim()),
+        download_hub: downloadHub === '' ? null : downloadHub,
+        model_path: modelPath?.trim() === '' ? null : modelPath?.trim(),
+      }
 
-    let modelDataWithID_other = {
-      model_uid: modelUID.trim() === '' ? null : modelUID.trim(),
-      model_name: modelData.model_name,
-      model_type: modelType,
-    }
-
-    if (modelType === 'embedding' || modelType === 'rerank') {
-      modelDataWithID_other = {
-        ...modelDataWithID_other,
+      const modelDataWithID_other = {
+        model_uid: modelUID?.trim() === '' ? null : modelUID?.trim(),
+        model_name: modelData.model_name,
+        model_type: modelType,
         replica: replica,
         n_gpu: nGpu === 'GPU' ? 'auto' : null,
-        worker_ip: workerIp.trim() === '' ? null : workerIp.trim(),
-        gpu_idx: GPUIdx.trim() === '' ? null : handleGPUIdx(GPUIdx.trim()),
+        worker_ip: workerIp?.trim() === '' ? null : workerIp.trim(),
+        gpu_idx: GPUIdx?.trim() === '' ? null : handleGPUIdx(GPUIdx?.trim()),
+        download_hub: downloadHub === '' ? null : downloadHub,
+        model_path: modelPath?.trim() === '' ? null : modelPath?.trim(),
       }
-    }
 
-    if (nGPULayers >= 0) {
-      modelDataWithID_LLM.n_gpu_layers = nGPULayers
-    }
-
-    if (
-      loraListArr.length ||
-      imageLoraLoadKwargsArr.length ||
-      imageLoraFuseKwargsArr.length
-    ) {
-      const peft_model_config = {}
-      if (imageLoraLoadKwargsArr.length) {
-        const image_lora_load_kwargs = {}
-        imageLoraLoadKwargsArr.forEach((item) => {
-          image_lora_load_kwargs[item.key] = handleValueType(item.value)
-        })
-        peft_model_config['image_lora_load_kwargs'] = image_lora_load_kwargs
+      if (nGPULayers >= 0) {
+        modelDataWithID_LLM.n_gpu_layers = nGPULayers
       }
-      if (imageLoraFuseKwargsArr.length) {
-        const image_lora_fuse_kwargs = {}
-        imageLoraFuseKwargsArr.forEach((item) => {
-          image_lora_fuse_kwargs[item.key] = handleValueType(item.value)
-        })
-        peft_model_config['image_lora_fuse_kwargs'] = image_lora_fuse_kwargs
-      }
-      if (loraListArr.length) {
-        const lora_list = loraListArr
-        lora_list.map((item) => {
-          delete item.id
-        })
-        peft_model_config['lora_list'] = lora_list
-      }
-      modelDataWithID_LLM['peft_model_config'] = peft_model_config
-    }
 
-    if (customParametersArr.length) {
-      customParametersArr.forEach((item) => {
-        modelDataWithID_LLM[item.key] = handleValueType(item.value)
-      })
-    }
+      const modelDataWithID =
+        modelType === 'LLM' ? modelDataWithID_LLM : modelDataWithID_other
 
-    const modelDataWithID =
-      modelType === 'LLM' ? modelDataWithID_LLM : modelDataWithID_other
-
-    // First fetcher request to initiate the model
-    fetcher(url + '/v1/models', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(modelDataWithID),
-    })
-      .then((response) => {
-        if (!response.ok) {
-          // Assuming the server returns error details in JSON format
-          response.json().then((errorData) => {
-            setErrorMsg(
-              `Server error: ${response.status} - ${
-                errorData.detail || 'Unknown error'
-              }`
-            )
+      if (
+        loraListArr.length ||
+        imageLoraLoadKwargsArr.length ||
+        imageLoraFuseKwargsArr.length
+      ) {
+        const peft_model_config = {}
+        if (imageLoraLoadKwargsArr.length) {
+          const image_lora_load_kwargs = {}
+          imageLoraLoadKwargsArr.forEach((item) => {
+            image_lora_load_kwargs[item.key] = handleValueType(item.value)
           })
-        } else {
+          peft_model_config['image_lora_load_kwargs'] = image_lora_load_kwargs
+        }
+        if (imageLoraFuseKwargsArr.length) {
+          const image_lora_fuse_kwargs = {}
+          imageLoraFuseKwargsArr.forEach((item) => {
+            image_lora_fuse_kwargs[item.key] = handleValueType(item.value)
+          })
+          peft_model_config['image_lora_fuse_kwargs'] = image_lora_fuse_kwargs
+        }
+        if (loraListArr.length) {
+          const lora_list = loraListArr
+          lora_list.map((item) => {
+            delete item.id
+          })
+          peft_model_config['lora_list'] = lora_list
+        }
+        modelDataWithID['peft_model_config'] = peft_model_config
+      }
+
+      if (customParametersArr.length) {
+        customParametersArr.forEach((item) => {
+          modelDataWithID[item.key] = handleValueType(item.value)
+        })
+      }
+
+      // First fetcher request to initiate the model
+      fetchWrapper
+        .post('/v1/models', modelDataWithID)
+        .then(() => {
           navigate(`/running_models/${modelType}`)
           sessionStorage.setItem(
             'runningModelType',
             `/running_models/${modelType}`
           )
-        }
-        setIsCallingApi(false)
-      })
-      .catch((error) => {
-        console.error('Error:', error)
-        setIsCallingApi(false)
-      })
+          let historyArr = JSON.parse(localStorage.getItem('historyArr')) || []
+          const historyModelNameArr = historyArr.map((item) => item.model_name)
+          if (historyModelNameArr.includes(modelDataWithID.model_name)) {
+            historyArr = historyArr.map((item) => {
+              if (item.model_name === modelDataWithID.model_name) {
+                return modelDataWithID
+              }
+              return item
+            })
+          } else {
+            historyArr.push(modelDataWithID)
+          }
+          localStorage.setItem('historyArr', JSON.stringify(historyArr))
+
+          setIsCallingApi(false)
+        })
+        .catch((error) => {
+          console.error('Error:', error)
+          if (error.response.status !== 403) {
+            setErrorMsg(error.message)
+          }
+          setIsCallingApi(false)
+        })
+    } catch (error) {
+      setOpenErrorSnackbar(true)
+      setErrorSnackbarValue(`${error}`)
+      setIsCallingApi(false)
+    }
   }
 
   const handleGPUIdx = (data) => {
@@ -371,22 +418,23 @@ const ModelCard = ({
     const subType = sessionStorage.getItem('subType').split('/')
     if (subType) {
       subType[3]
-      fetcher(
-        url +
+      fetchWrapper
+        .delete(
           `/v1/model_registrations/${
             subType[3] === 'llm' ? 'LLM' : subType[3]
-          }/${modelData.model_name}`,
-        {
-          method: 'DELETE',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        }
-      )
+          }/${modelData.model_name}`
+        )
         .then(() => {
           setCustomDeleted(true)
+          onHandlecustomDelete(modelData.model_name)
+          setIsDeleteCustomModel(false)
         })
-        .catch(console.error)
+        .catch((error) => {
+          console.error(error)
+          if (error.response.status !== 403) {
+            setErrorMsg(error.message)
+          }
+        })
     }
   }
 
@@ -405,6 +453,7 @@ const ModelCard = ({
   }
 
   const handleValueType = (str) => {
+    str = String(str)
     if (str.toLowerCase() === 'none') {
       return null
     } else if (str.toLowerCase() === 'true') {
@@ -418,22 +467,6 @@ const ModelCard = ({
     }
   }
 
-  const getLoraListArr = (arr) => {
-    setLoraListArr(arr)
-  }
-
-  const getImageLoraLoadKwargsArr = (arr) => {
-    setImageLoraLoadKwargsArr(arr)
-  }
-
-  const getImageLoraFuseKwargsArr = (arr) => {
-    setImageLoraFuseKwargsArr(arr)
-  }
-
-  const getCustomParametersArr = (arr) => {
-    setCustomParametersArr(arr)
-  }
-
   const StyledTableRow = styled(TableRow)(({ theme }) => ({
     '&:nth-of-type(odd)': {
       backgroundColor: theme.palette.action.hover,
@@ -445,17 +478,6 @@ const ModelCard = ({
 
   const handleChangePage = (_, newPage) => {
     setPage(newPage)
-  }
-
-  const handleCopyPath = (path) => {
-    const clipboard = new ClipboardJS('.copyPath', {
-      text: () => path,
-    })
-
-    clipboard.on('success', (e) => {
-      e.clearSelection()
-      setIsCopySuccess(true)
-    })
   }
 
   const handleOpenCachedList = () => {
@@ -474,29 +496,14 @@ const ModelCard = ({
   }
 
   const getCachedList = () => {
-    fetcher(url + `/v1/cache/models?model_name=${modelData.model_name}`, {
-      method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    })
-      .then((response) => {
-        if (!response.ok) {
-          response.json().then((errorData) => {
-            setErrorMsg(
-              `Server error: ${response.status} - ${
-                errorData.detail || 'Unknown error'
-              }`
-            )
-          })
-        } else {
-          response.json().then((data) => {
-            setCachedListArr(data.list)
-          })
-        }
-      })
+    fetchWrapper
+      .get(`/v1/cache/models?model_name=${modelData.model_name}`)
+      .then((data) => setCachedListArr(data.list))
       .catch((error) => {
-        console.error('Error:', error)
+        console.error(error)
+        if (error.response.status !== 403) {
+          setErrorMsg(error.message)
+        }
       })
   }
 
@@ -507,56 +514,253 @@ const ModelCard = ({
   }
 
   const handleDeleteCached = () => {
-    fetcher(url + `/v1/cache/models?model_version=${cachedModelVersion}`, {
-      method: 'DELETE',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    })
-      .then((response) => {
-        if (!response.ok) {
-          response.json().then((errorData) => {
-            setErrorMsg(
-              `Server error: ${response.status} - ${
-                errorData.detail || 'Unknown error'
-              }`
-            )
-          })
-        } else {
-          response.json().then(() => {
-            const cachedArr = cachedListArr.filter(
-              (item) => item.real_path !== cachedRealPath
-            )
-            setCachedListArr(cachedArr)
-            setIsDeleteCached(false)
-            if (cachedArr.length) {
-              if (
-                (page + 1) * 5 >= cachedListArr.length &&
-                cachedArr.length % 5 === 0
-              ) {
-                setPage(cachedArr.length / 5 - 1)
-              }
-            }
-          })
+    fetchWrapper
+      .delete(`/v1/cache/models?model_version=${cachedModelVersion}`)
+      .then(() => {
+        const cachedArr = cachedListArr.filter(
+          (item) => item.real_path !== cachedRealPath
+        )
+        setCachedListArr(cachedArr)
+        setIsDeleteCached(false)
+        if (cachedArr.length) {
+          if (
+            (page + 1) * 5 >= cachedListArr.length &&
+            cachedArr.length % 5 === 0
+          ) {
+            setPage(cachedArr.length / 5 - 1)
+          }
         }
       })
       .catch((error) => {
-        console.error('Error:', error)
+        console.error(error)
+        if (error.response.status !== 403) {
+          setErrorMsg(error.message)
+        }
       })
+  }
+
+  const handleJsonDataPresentation = () => {
+    const arr = sessionStorage.getItem('subType').split('/')
+    sessionStorage.setItem(
+      'registerModelType',
+      `/register_model/${arr[arr.length - 1]}`
+    )
+    sessionStorage.setItem('customJsonData', JSON.stringify(modelData))
+    navigate(`/register_model/${arr[arr.length - 1]}/${modelData.model_name}`)
+  }
+
+  const handleGetHistory = () => {
+    const historyArr = JSON.parse(localStorage.getItem('historyArr')) || []
+    return historyArr.filter((item) => item.model_name === modelData.model_name)
+  }
+
+  const handleLlmHistory = () => {
+    const arr = handleGetHistory()
+    if (arr.length) {
+      const {
+        model_engine,
+        model_format,
+        model_size_in_billions,
+        quantization,
+        n_gpu,
+        n_gpu_layers,
+        replica,
+        model_uid,
+        request_limits,
+        worker_ip,
+        gpu_idx,
+        download_hub,
+        model_path,
+        peft_model_config,
+      } = arr[0]
+
+      if (!engineOptions.includes(model_engine)) {
+        setModelEngine('')
+      } else {
+        setModelEngine(model_engine || '')
+      }
+      setModelFormat(model_format || '')
+      setModelSize(String(model_size_in_billions) || '')
+      setQuantization(quantization || '')
+      setNGPU(n_gpu || 'auto')
+      if (n_gpu_layers >= 0) {
+        setNGPULayers(n_gpu_layers)
+      } else {
+        setNGPULayers(-1)
+      }
+      setReplica(replica || 1)
+      setModelUID(model_uid || '')
+      setRequestLimits(request_limits || '')
+      setWorkerIp(worker_ip || '')
+      setGPUIdx(gpu_idx?.join(',') || '')
+      setDownloadHub(download_hub || '')
+      setModelPath(model_path || '')
+
+      let loraData = []
+      peft_model_config?.lora_list?.forEach((item) => {
+        loraData.push({
+          lora_name: item.lora_name,
+          local_path: item.local_path,
+        })
+      })
+      setLoraArr(loraData)
+
+      let customData = []
+      for (let key in arr[0]) {
+        !llmAllDataKey.includes(key) &&
+          customData.push({ key: key, value: arr[0][key] || 'none' })
+      }
+      setCustomArr(customData)
+
+      if (
+        model_uid ||
+        request_limits ||
+        worker_ip ||
+        gpu_idx?.join(',') ||
+        download_hub ||
+        model_path
+      )
+        setIsOther(true)
+
+      if (loraData.length) {
+        setIsOther(true)
+        setIsPeftModelConfig(true)
+      }
+    }
+  }
+
+  const handleOtherHistory = () => {
+    const arr = handleGetHistory()
+    if (arr.length) {
+      setModelUID(arr[0].model_uid || '')
+      setReplica(arr[0].replica || 1)
+      setNGpu(arr[0].n_gpu === 'auto' ? 'GPU' : 'CPU')
+      setGPUIdx(arr[0].gpu_idx?.join(',') || '')
+      setWorkerIp(arr[0].worker_ip || '')
+      setDownloadHub(arr[0].download_hub || '')
+      setModelPath(arr[0].model_path || '')
+
+      if (arr[0].model_type === 'image') {
+        let loraData = []
+        arr[0].peft_model_config?.lora_list?.forEach((item) => {
+          loraData.push({
+            lora_name: item.lora_name,
+            local_path: item.local_path,
+          })
+        })
+        setLoraArr(loraData)
+
+        let ImageLoraLoadData = []
+        for (let key in arr[0].peft_model_config?.image_lora_load_kwargs) {
+          ImageLoraLoadData.push({
+            key: key,
+            value:
+              arr[0].peft_model_config?.image_lora_load_kwargs[key] || 'none',
+          })
+        }
+        setImageLoraLoadArr(ImageLoraLoadData)
+
+        let ImageLoraFuseData = []
+        for (let key in arr[0].peft_model_config?.image_lora_fuse_kwargs) {
+          ImageLoraFuseData.push({
+            key: key,
+            value:
+              arr[0].peft_model_config?.image_lora_fuse_kwargs[key] || 'none',
+          })
+        }
+        setImageLoraFuseArr(ImageLoraFuseData)
+
+        if (
+          loraData.length ||
+          ImageLoraLoadData.length ||
+          ImageLoraFuseData.length
+        ) {
+          setIsPeftModelConfig(true)
+        }
+      }
+
+      let customData = []
+      for (let key in arr[0]) {
+        !llmAllDataKey.includes(key) &&
+          customData.push({ key: key, value: arr[0][key] || 'none' })
+      }
+      setCustomArr(customData)
+    }
+  }
+
+  const handleCollection = (bool) => {
+    setHover(false)
+
+    let collectionArr = JSON.parse(localStorage.getItem('collectionArr')) || []
+    if (bool) {
+      collectionArr.push(modelData.model_name)
+    } else {
+      collectionArr = collectionArr.filter(
+        (item) => item !== modelData.model_name
+      )
+    }
+    localStorage.setItem('collectionArr', JSON.stringify(collectionArr))
+
+    onGetCollectionArr(collectionArr)
+  }
+
+  const handleDeleteChip = () => {
+    const arr = JSON.parse(localStorage.getItem('historyArr'))
+    const newArr = arr.filter(
+      (item) => item.model_name !== modelData.model_name
+    )
+    localStorage.setItem('historyArr', JSON.stringify(newArr))
+    setIsHistory(false)
+    if (modelType === 'LLM') {
+      setModelEngine('')
+      setModelFormat('')
+      setModelSize('')
+      setQuantization('')
+      setNGPU('auto')
+      setReplica(1)
+      setModelUID('')
+      setRequestLimits('')
+      setWorkerIp('')
+      setGPUIdx('')
+      setDownloadHub('')
+      setModelPath('')
+      setLoraArr([])
+      setCustomArr([])
+      setIsOther(false)
+      setIsPeftModelConfig(false)
+    } else {
+      setModelUID('')
+      setReplica(1)
+      setNGpu(gpuAvailable === 0 ? 'CPU' : 'GPU')
+      setGPUIdx('')
+      setWorkerIp('')
+      setDownloadHub('')
+      setModelPath('')
+      setLoraArr([])
+      setImageLoraLoadArr([])
+      setImageLoraFuseArr([])
+      setCustomArr([])
+      setIsPeftModelConfig(false)
+    }
   }
 
   // Set two different states based on mouse hover
   return (
     <>
       <Paper
+        id={modelData.model_name}
         className="container"
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
         onClick={() => {
           if (!selected && !customDeleted) {
+            const arr = handleGetHistory()
+            if (arr.length) setIsHistory(true)
             setSelected(true)
             if (modelType === 'LLM') {
               getModelEngine(modelData.model_name)
+            } else {
+              handleOtherHistory()
             }
           }
         }}
@@ -565,18 +769,69 @@ const ModelCard = ({
         {modelType === 'LLM' ? (
           <Box className="descriptionCard">
             {is_custom && (
-              <Stack direction="row" spacing={1} useFlexGap>
+              <div className="cardTitle">
                 <TitleTypography value={modelData.model_name} />
-                <IconButton
-                  aria-label="delete"
-                  onClick={handeCustomDelete}
-                  disabled={customDeleted}
-                >
-                  <DeleteIcon />
-                </IconButton>
-              </Stack>
+                <div className="iconButtonBox">
+                  <Tooltip title={'Edit'} placement="top">
+                    <IconButton
+                      aria-label="show"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setIsJsonShow(true)
+                      }}
+                    >
+                      <EditNote />
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip title={'delete'} placement="top">
+                    <IconButton
+                      aria-label="delete"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setIsDeleteCustomModel(true)
+                      }}
+                    >
+                      <Delete />
+                    </IconButton>
+                  </Tooltip>
+                </div>
+              </div>
             )}
-            {!is_custom && <TitleTypography value={modelData.model_name} />}
+            {!is_custom && (
+              <div className="cardTitle">
+                <TitleTypography value={modelData.model_name} />
+                <div className="iconButtonBox">
+                  {JSON.parse(localStorage.getItem('collectionArr'))?.includes(
+                    modelData.model_name
+                  ) ? (
+                    <Tooltip title={'Unfavorite'} placement="top">
+                      <IconButton
+                        aria-label="collection"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleCollection(false)
+                        }}
+                      >
+                        <Grade style={{ color: 'rgb(255, 206, 0)' }} />
+                      </IconButton>
+                    </Tooltip>
+                  ) : (
+                    <Tooltip title={'Favorite'} placement="top">
+                      <IconButton
+                        aria-label="cancellation-of-collections"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleCollection(true)
+                        }}
+                      >
+                        <StarBorder />
+                      </IconButton>
+                    </Tooltip>
+                  )}
+                </div>
+              </div>
+            )}
+
             <Stack
               spacing={1}
               direction="row"
@@ -665,18 +920,70 @@ const ModelCard = ({
           <Box className="descriptionCard">
             <div className="titleContainer">
               {is_custom && (
-                <Stack direction="row" spacing={1} useFlexGap>
+                <div className="cardTitle">
                   <TitleTypography value={modelData.model_name} />
-                  <IconButton
-                    aria-label="delete"
-                    onClick={handeCustomDelete}
-                    disabled={customDeleted}
-                  >
-                    <DeleteIcon />
-                  </IconButton>
-                </Stack>
+                  <div className="iconButtonBox">
+                    <Tooltip title={'Edit'} placement="top">
+                      <IconButton
+                        aria-label="show"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setIsJsonShow(true)
+                        }}
+                      >
+                        <EditNote />
+                      </IconButton>
+                    </Tooltip>
+                    <Tooltip title={'delete'} placement="top">
+                      <IconButton
+                        aria-label="delete"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setIsDeleteCustomModel(true)
+                        }}
+                        disabled={customDeleted}
+                      >
+                        <Delete />
+                      </IconButton>
+                    </Tooltip>
+                  </div>
+                </div>
               )}
-              {!is_custom && <TitleTypography value={modelData.model_name} />}
+              {!is_custom && (
+                <div className="cardTitle">
+                  <TitleTypography value={modelData.model_name} />
+                  <div className="iconButtonBox">
+                    {JSON.parse(
+                      localStorage.getItem('collectionArr')
+                    )?.includes(modelData.model_name) ? (
+                      <Tooltip title={'Unfavorite'} placement="top">
+                        <IconButton
+                          aria-label="collection"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            handleCollection(false)
+                          }}
+                        >
+                          <Grade style={{ color: 'rgb(255, 206, 0)' }} />
+                        </IconButton>
+                      </Tooltip>
+                    ) : (
+                      <Tooltip title={'Favorite'} placement="top">
+                        <IconButton
+                          aria-label="cancellation-of-collections"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            handleCollection(true)
+                          }}
+                        >
+                          <StarBorder />
+                        </IconButton>
+                      </Tooltip>
+                    )}
+                  </div>
+                </div>
+              )}
+
               <Stack
                 spacing={1}
                 direction="row"
@@ -687,7 +994,14 @@ const ModelCard = ({
                 {(() => {
                   if (modelData.language) {
                     return modelData.language.map((v) => {
-                      return <Chip label={v} variant="outlined" size="small" />
+                      return (
+                        <Chip
+                          key={v}
+                          label={v}
+                          variant="outlined"
+                          size="small"
+                        />
+                      )
                     })
                   } else if (modelData.model_family) {
                     return (
@@ -720,6 +1034,11 @@ const ModelCard = ({
                   }
                 })()}
               </Stack>
+              {modelData.model_description && (
+                <p className="p" title={modelData.model_description}>
+                  {modelData.model_description}
+                </p>
+              )}
             </div>
             {modelData.dimensions && (
               <div className="iconRow">
@@ -742,6 +1061,14 @@ const ModelCard = ({
         )}
       </Paper>
 
+      <DeleteDialog
+        text={
+          'Are you sure to delete this custom model? This behavior is irreversible.'
+        }
+        isDelete={isDeleteCustomModel}
+        onHandleIsDelete={() => setIsDeleteCustomModel(false)}
+        onHandleDelete={handeCustomDelete}
+      />
       <Drawer
         open={selected}
         onClose={() => {
@@ -751,7 +1078,19 @@ const ModelCard = ({
         anchor={'right'}
       >
         <div className="drawerCard">
-          <TitleTypography value={modelData.model_name} />
+          <div style={{ display: 'flex', alignItems: 'center' }}>
+            <TitleTypography value={modelData.model_name} />
+            {isHistory && (
+              <Chip
+                label="Last Config"
+                variant="outlined"
+                size="small"
+                color="primary"
+                onDelete={handleDeleteChip}
+              />
+            )}
+          </div>
+
           {modelType === 'LLM' ? (
             <Box
               ref={parentRef}
@@ -879,7 +1218,7 @@ const ModelCard = ({
                       onChange={(e) => setQuantization(e.target.value)}
                       label="Quantization"
                     >
-                      {quantizationOptions.map((quant, index) => {
+                      {quantizationOptions.map((quant) => {
                         const specs = modelData.model_specs
                           .filter((spec) => spec.model_format === modelFormat)
                           .filter(
@@ -888,10 +1227,14 @@ const ModelCard = ({
                               convertModelSize(modelSize)
                           )
 
-                        const cached =
-                          modelFormat === 'pytorch'
-                            ? specs[0]?.cache_status ?? false === true
-                            : specs[0]?.cache_status?.[index] ?? false === true
+                        const spec = specs.find((s) => {
+                          return s.quantizations.includes(quant)
+                        })
+                        const cached = Array.isArray(spec?.cache_status)
+                          ? spec?.cache_status[
+                              spec?.quantizations.indexOf(quant)
+                            ]
+                          : spec?.cache_status
 
                         const displayedQuant = cached
                           ? quant + ' (cached)'
@@ -966,8 +1309,13 @@ const ModelCard = ({
                   </FormControl>
                 </Grid>
                 <ListItemButton onClick={() => setIsOther(!isOther)}>
-                  <ListItemText primary="Optional Configurations" />
-                  {isOther ? <ExpandLess /> : <ExpandMore />}
+                  <div style={{ display: 'flex', alignItems: 'center' }}>
+                    <ListItemText
+                      primary="Optional Configurations"
+                      style={{ marginRight: 10 }}
+                    />
+                    {isOther ? <ExpandLess /> : <ExpandMore />}
+                  </div>
                 </ListItemButton>
                 <Collapse in={isOther} timeout="auto" unmountOnExit>
                   <Grid item xs={12}>
@@ -1041,11 +1389,65 @@ const ModelCard = ({
                       )}
                     </FormControl>
                   </Grid>
+                  <Grid item xs={12}>
+                    <FormControl variant="outlined" margin="normal" fullWidth>
+                      <InputLabel id="quantization-label">
+                        (Optional) Download_hub
+                      </InputLabel>
+                      <Select
+                        labelId="download_hub-label"
+                        value={downloadHub}
+                        onChange={(e) => {
+                          e.target.value === 'none'
+                            ? setDownloadHub('')
+                            : setDownloadHub(e.target.value)
+                        }}
+                        label="(Optional) Download_hub"
+                      >
+                        {(csghubArr.includes(modelData.model_name)
+                          ? [
+                              'none',
+                              'huggingface',
+                              'modelscope',
+                              'openmind_hub',
+                              'csghub',
+                            ]
+                          : [
+                              'none',
+                              'huggingface',
+                              'modelscope',
+                              'openmind_hub',
+                            ]
+                        ).map((item) => {
+                          return (
+                            <MenuItem key={item} value={item}>
+                              {item}
+                            </MenuItem>
+                          )
+                        })}
+                      </Select>
+                    </FormControl>
+                  </Grid>
+                  <Grid item xs={12}>
+                    <FormControl variant="outlined" margin="normal" fullWidth>
+                      <TextField
+                        variant="outlined"
+                        value={modelPath}
+                        label="(Optional) Model Path, For PyTorch, provide the model directory. For GGML/GGUF, provide the model file path."
+                        onChange={(e) => setModelPath(e.target.value)}
+                      />
+                    </FormControl>
+                  </Grid>
                   <ListItemButton
                     onClick={() => setIsPeftModelConfig(!isPeftModelConfig)}
                   >
-                    <ListItemText primary="Lora Config" />
-                    {isPeftModelConfig ? <ExpandLess /> : <ExpandMore />}
+                    <div style={{ display: 'flex', alignItems: 'center' }}>
+                      <ListItemText
+                        primary="Lora Config"
+                        style={{ marginRight: 10 }}
+                      />
+                      {isPeftModelConfig ? <ExpandLess /> : <ExpandMore />}
+                    </div>
                   </ListItemButton>
                   <Collapse
                     in={isPeftModelConfig}
@@ -1059,26 +1461,11 @@ const ModelCard = ({
                         key: 'lora_name',
                         value: 'local_path',
                       }}
-                      onGetArr={getLoraListArr}
-                      onJudgeArr={judgeArr}
-                    />
-                    <AddPair
-                      customData={{
-                        title: 'Lora Load Kwargs for Image Model',
-                        key: 'key',
-                        value: 'value',
+                      onGetArr={(arr) => {
+                        setLoraListArr(arr)
                       }}
-                      onGetArr={getImageLoraLoadKwargsArr}
                       onJudgeArr={judgeArr}
-                    />
-                    <AddPair
-                      customData={{
-                        title: 'Lora Fuse Kwargs for Image Model',
-                        key: 'key',
-                        value: 'value',
-                      }}
-                      onGetArr={getImageLoraFuseKwargsArr}
-                      onJudgeArr={judgeArr}
+                      pairData={loraArr}
                     />
                   </Collapse>
                 </Collapse>
@@ -1090,86 +1477,198 @@ const ModelCard = ({
                     key: 'key',
                     value: 'value',
                   }}
-                  onGetArr={getCustomParametersArr}
+                  onGetArr={(arr) => {
+                    setCustomParametersArr(arr)
+                  }}
                   onJudgeArr={judgeArr}
+                  pairData={customArr}
                 />
               </Grid>
             </Box>
           ) : (
-            <FormControl variant="outlined" margin="normal" fullWidth>
-              <TextField
-                variant="outlined"
-                value={modelUID}
-                label="(Optional) Model UID, model name by default"
-                onChange={(e) => setModelUID(e.target.value)}
-              />
-              {(modelType === 'embedding' || modelType === 'rerank') && (
-                <>
-                  <TextField
-                    style={{ marginTop: '25px' }}
-                    type="number"
-                    InputProps={{
-                      inputProps: {
-                        min: 1,
-                      },
-                    }}
-                    label="Replica"
-                    value={replica}
-                    onChange={(e) => setReplica(parseInt(e.target.value, 10))}
-                  />
-                  <FormControl variant="outlined" margin="normal" fullWidth>
-                    <InputLabel id="n-gpu-label">Device</InputLabel>
-                    <Select
-                      labelId="n-gpu-label"
-                      value={nGpu}
-                      onChange={(e) => setNGpu(e.target.value)}
-                      label="N-GPU"
-                    >
-                      {getNewNGPURange().map((v) => {
-                        return (
-                          <MenuItem key={v} value={v}>
-                            {v}
-                          </MenuItem>
-                        )
-                      })}
-                    </Select>
-                  </FormControl>
-                  {nGpu === 'GPU' && (
-                    <FormControl variant="outlined" margin="normal" fullWidth>
-                      <TextField
-                        value={GPUIdx}
-                        label="GPU Idx, Specify the GPU index where the model is located"
-                        onChange={(e) => {
-                          setGPUIdxAlert(false)
-                          setGPUIdx(e.target.value)
-                          const regular = /^\d+(?:,\d+)*$/
-                          if (
-                            e.target.value !== '' &&
-                            !regular.test(e.target.value)
-                          ) {
-                            setGPUIdxAlert(true)
-                          }
-                        }}
-                      />
-                      {GPUIdxAlert && (
-                        <Alert severity="error">
-                          Please enter numeric data separated by commas, for
-                          example: 0,1,2
-                        </Alert>
-                      )}
-                    </FormControl>
-                  )}
+            <Box
+              ref={parentRef}
+              className="formContainer"
+              display="flex"
+              flexDirection="column"
+              width="100%"
+              mx="auto"
+            >
+              <FormControl variant="outlined" margin="normal" fullWidth>
+                <TextField
+                  variant="outlined"
+                  value={modelUID}
+                  label="(Optional) Model UID, model name by default"
+                  onChange={(e) => setModelUID(e.target.value)}
+                />
+                <TextField
+                  style={{ marginTop: '25px' }}
+                  type="number"
+                  InputProps={{
+                    inputProps: {
+                      min: 1,
+                    },
+                  }}
+                  label="Replica"
+                  value={replica}
+                  onChange={(e) => setReplica(parseInt(e.target.value, 10))}
+                />
+                <FormControl variant="outlined" margin="normal" fullWidth>
+                  <InputLabel id="n-gpu-label">Device</InputLabel>
+                  <Select
+                    labelId="n-gpu-label"
+                    value={nGpu}
+                    onChange={(e) => setNGpu(e.target.value)}
+                    label="N-GPU"
+                  >
+                    {getNewNGPURange().map((v) => {
+                      return (
+                        <MenuItem key={v} value={v}>
+                          {v}
+                        </MenuItem>
+                      )
+                    })}
+                  </Select>
+                </FormControl>
+                {nGpu === 'GPU' && (
                   <FormControl variant="outlined" margin="normal" fullWidth>
                     <TextField
-                      variant="outlined"
-                      value={workerIp}
-                      label="Worker Ip, specify the worker ip where the model is located in a distributed scenario"
-                      onChange={(e) => setWorkerIp(e.target.value)}
+                      value={GPUIdx}
+                      label="GPU Idx, Specify the GPU index where the model is located"
+                      onChange={(e) => {
+                        setGPUIdxAlert(false)
+                        setGPUIdx(e.target.value)
+                        const regular = /^\d+(?:,\d+)*$/
+                        if (
+                          e.target.value !== '' &&
+                          !regular.test(e.target.value)
+                        ) {
+                          setGPUIdxAlert(true)
+                        }
+                      }}
                     />
+                    {GPUIdxAlert && (
+                      <Alert severity="error">
+                        Please enter numeric data separated by commas, for
+                        example: 0,1,2
+                      </Alert>
+                    )}
                   </FormControl>
-                </>
-              )}
-            </FormControl>
+                )}
+                <FormControl variant="outlined" margin="normal" fullWidth>
+                  <TextField
+                    variant="outlined"
+                    value={workerIp}
+                    label="Worker Ip, specify the worker ip where the model is located in a distributed scenario"
+                    onChange={(e) => setWorkerIp(e.target.value)}
+                  />
+                </FormControl>
+                <FormControl variant="outlined" margin="normal" fullWidth>
+                  <InputLabel id="quantization-label">
+                    (Optional) Download_hub
+                  </InputLabel>
+                  <Select
+                    labelId="download_hub-label"
+                    value={downloadHub}
+                    onChange={(e) => {
+                      e.target.value === 'none'
+                        ? setDownloadHub('')
+                        : setDownloadHub(e.target.value)
+                    }}
+                    label="(Optional) Download_hub"
+                  >
+                    {['none', 'huggingface', 'modelscope', 'openmind_hub'].map(
+                      (item) => {
+                        return (
+                          <MenuItem key={item} value={item}>
+                            {item}
+                          </MenuItem>
+                        )
+                      }
+                    )}
+                  </Select>
+                </FormControl>
+                <FormControl variant="outlined" margin="normal" fullWidth>
+                  <TextField
+                    variant="outlined"
+                    value={modelPath}
+                    label="(Optional) Model Path, For PyTorch, provide the model directory. For GGML/GGUF, provide the model file path."
+                    onChange={(e) => setModelPath(e.target.value)}
+                  />
+                </FormControl>
+                {modelType === 'image' && (
+                  <>
+                    <ListItemButton
+                      onClick={() => setIsPeftModelConfig(!isPeftModelConfig)}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center' }}>
+                        <ListItemText
+                          primary="Lora Config"
+                          style={{ marginRight: 10 }}
+                        />
+                        {isPeftModelConfig ? <ExpandLess /> : <ExpandMore />}
+                      </div>
+                    </ListItemButton>
+                    <Collapse
+                      in={isPeftModelConfig}
+                      timeout="auto"
+                      unmountOnExit
+                      style={{ marginLeft: '30px' }}
+                    >
+                      <AddPair
+                        customData={{
+                          title: 'Lora Model Config',
+                          key: 'lora_name',
+                          value: 'local_path',
+                        }}
+                        onGetArr={(arr) => {
+                          setLoraListArr(arr)
+                        }}
+                        onJudgeArr={judgeArr}
+                        pairData={loraArr}
+                      />
+                      <AddPair
+                        customData={{
+                          title: 'Lora Load Kwargs for Image Model',
+                          key: 'key',
+                          value: 'value',
+                        }}
+                        onGetArr={(arr) => {
+                          setImageLoraLoadKwargsArr(arr)
+                        }}
+                        onJudgeArr={judgeArr}
+                        pairData={imageLoraLoadArr}
+                      />
+                      <AddPair
+                        customData={{
+                          title: 'Lora Fuse Kwargs for Image Model',
+                          key: 'key',
+                          value: 'value',
+                        }}
+                        onGetArr={(arr) => {
+                          setImageLoraFuseKwargsArr(arr)
+                        }}
+                        onJudgeArr={judgeArr}
+                        pairData={imageLoraFuseArr}
+                      />
+                    </Collapse>
+                  </>
+                )}
+                <AddPair
+                  customData={{
+                    title:
+                      'Additional parameters passed to the inference engine',
+                    key: 'key',
+                    value: 'value',
+                  }}
+                  onGetArr={(arr) => {
+                    setCustomParametersArr(arr)
+                  }}
+                  onJudgeArr={judgeArr}
+                  pairData={customArr}
+                />
+              </FormControl>
+            </Box>
           )}
           <Box className="buttonsContainer">
             <button
@@ -1187,14 +1686,14 @@ const ModelCard = ({
                       (quantization ||
                         (!modelData.is_builtin && modelFormat !== 'pytorch'))
                     ) ||
-                    !judgeArr(customParametersArr, ['key', 'value']) ||
                     !judgeArr(loraListArr, ['lora_name', 'local_path']) ||
                     !judgeArr(imageLoraLoadKwargsArr, ['key', 'value']) ||
                     !judgeArr(imageLoraFuseKwargsArr, ['key', 'value']) ||
                     requestLimitsAlert ||
                     GPUIdxAlert)) ||
                 ((modelType === 'embedding' || modelType === 'rerank') &&
-                  GPUIdxAlert)
+                  GPUIdxAlert) ||
+                !judgeArr(customParametersArr, ['key', 'value'])
               }
             >
               {(() => {
@@ -1257,13 +1756,55 @@ const ModelCard = ({
           </Box>
         </div>
       </Drawer>
+      <Backdrop
+        sx={{ color: '#fff', zIndex: (theme) => theme.zIndex.drawer + 1 }}
+        open={isJsonShow}
+      >
+        <div className="jsonDialog">
+          <div className="jsonDialog-title">
+            <div className="title-name">{modelData.model_name}</div>
+            <CopyComponent
+              tip={'Copy Json'}
+              text={JSON.stringify(modelData, null, 4)}
+            />
+          </div>
+          <div className="main-box">
+            <textarea
+              readOnly
+              className="textarea-box"
+              value={JSON.stringify(modelData, null, 4)}
+            />
+          </div>
+          <div className="but-box">
+            <Button
+              onClick={() => {
+                setIsJsonShow(false)
+              }}
+              style={{ marginRight: 30 }}
+            >
+              Cancel
+            </Button>
+            <Button onClick={handleJsonDataPresentation}>Edit</Button>
+          </div>
+        </div>
+      </Backdrop>
       <Snackbar
         anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
         open={openSnackbar}
         onClose={() => setOpenSnackbar(false)}
-        message="Please fill in the complete parameters before adding!!"
+        message="Please fill in the complete parameters before adding!"
         key={'top' + 'center'}
       />
+      <Snackbar
+        anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
+        open={openErrorSnackbar}
+        onClose={() => setOpenErrorSnackbar(false)}
+        key={'top' + 'center'}
+      >
+        <Alert severity="error" variant="filled" sx={{ width: '100%' }}>
+          {errorSnackbarValue}
+        </Alert>
+      </Snackbar>
 
       <Backdrop
         sx={{ color: '#fff', zIndex: (theme) => theme.zIndex.drawer + 1 }}
@@ -1343,12 +1884,10 @@ const ModelCard = ({
                       </Tooltip>
                     </TableCell>
                     <TableCell>
-                      <Tooltip title="Copy real_path" placement="top">
-                        <FilterNoneIcon
-                          className="copyPath"
-                          onClick={() => handleCopyPath(row.real_path)}
-                        />
-                      </Tooltip>
+                      <CopyComponent
+                        tip={'Copy real_path'}
+                        text={row.real_path}
+                      />
                     </TableCell>
                     <TableCell>
                       <Tooltip title={row.path}>
@@ -1362,12 +1901,7 @@ const ModelCard = ({
                       </Tooltip>
                     </TableCell>
                     <TableCell>
-                      <Tooltip title="Copy path" placement="top">
-                        <FilterNoneIcon
-                          className="copyPath"
-                          onClick={() => handleCopyPath(row.path)}
-                        />
-                      </Tooltip>
+                      <CopyComponent tip={'Copy path'} text={row.path} />
                     </TableCell>
                     <TableCell>{row.actor_ip_address}</TableCell>
                     <TableCell align={modelType === 'LLM' ? 'center' : 'left'}>
@@ -1381,7 +1915,7 @@ const ModelCard = ({
                           )
                         }
                       >
-                        <DeleteIcon />
+                        <Delete />
                       </IconButton>
                     </TableCell>
                   </StyledTableRow>
@@ -1407,44 +1941,12 @@ const ModelCard = ({
           />
         </div>
       </Backdrop>
-      <Dialog
-        open={isDeleteCached}
-        aria-labelledby="alert-dialog-title"
-        aria-describedby="alert-dialog-description"
-      >
-        <DialogTitle id="alert-dialog-title">Warning</DialogTitle>
-        <DialogContent>
-          <DialogContentText
-            className="deleteDialog"
-            id="alert-dialog-description"
-          >
-            <WarningAmber className="warningIcon" />
-            <p>Confirm deletion of cache files? This action is irreversible.</p>
-          </DialogContentText>
-        </DialogContent>
-        <DialogActions>
-          <Button
-            onClick={() => {
-              setIsDeleteCached(false)
-            }}
-          >
-            no
-          </Button>
-          <Button onClick={handleDeleteCached} autoFocus>
-            yes
-          </Button>
-        </DialogActions>
-      </Dialog>
-      <Snackbar
-        anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
-        open={isCopySuccess}
-        autoHideDuration={1500}
-        onClose={() => setIsCopySuccess(false)}
-      >
-        <Alert severity="success" variant="filled" sx={{ width: '100%' }}>
-          Copied to clipboard!
-        </Alert>
-      </Snackbar>
+      <DeleteDialog
+        text={'Confirm deletion of cache files? This action is irreversible.'}
+        isDelete={isDeleteCached}
+        onHandleIsDelete={() => setIsDeleteCached(false)}
+        onHandleDelete={handleDeleteCached}
+      />
     </>
   )
 }

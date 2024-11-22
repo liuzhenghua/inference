@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import os
 import sys
 import threading
 import time
@@ -48,7 +47,7 @@ class BaseThread(threading.Thread):
 class InferenceThread(BaseThread):
     def __init__(self, prompt, generate_config, client, model):
         super().__init__()
-        self._prompt = prompt
+        self._prompt = [{"role": "user", "content": prompt}]
         self._generate_config = generate_config
         self._client = client
         self._model = model
@@ -71,9 +70,10 @@ class InferenceThread(BaseThread):
             assert isinstance(res, dict)
             choices = res["choices"]
             assert isinstance(choices, list)
-            choice = choices[0]["text"]
-            assert isinstance(choice, str)
-            assert len(choice) > 0
+            choice = choices[0]["message"]
+            assert isinstance(choice, dict)
+            content = choice["content"]
+            assert len(content) > 0
 
 
 class InferenceThreadWithError(InferenceThread):
@@ -111,16 +111,11 @@ class AbortThread(BaseThread):
         assert result["msg"] == self._expected_res
 
 
-@pytest.fixture
-def enable_batch():
-    os.environ["XINFERENCE_TRANSFORMERS_ENABLE_BATCHING"] = "1"
-
-
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="does not run on windows github CI due to its terrible runtime",
 )
-def test_continuous_batching(enable_batch, setup):
+def test_continuous_batching(setup):
     endpoint, _ = setup
     url = f"{endpoint}/v1/models"
     client = RESTfulClient(endpoint)
@@ -129,7 +124,7 @@ def test_continuous_batching(enable_batch, setup):
     payload = {
         "model_engine": "transformers",
         "model_type": "LLM",
-        "model_name": "qwen1.5-chat",
+        "model_name": "qwen2.5-instruct",
         "quantization": "none",
         "model_format": "pytorch",
         "model_size_in_billions": "0_5",
@@ -143,7 +138,7 @@ def test_continuous_batching(enable_batch, setup):
     response = requests.post(url, json=payload)
     response_data = response.json()
     model_uid_res = response_data["model_uid"]
-    assert model_uid_res == "qwen1.5-chat"
+    assert model_uid_res == "qwen2.5-instruct"
 
     model = client.get_model(model_uid_res)
 
@@ -156,11 +151,12 @@ def test_continuous_batching(enable_batch, setup):
     thread2.join()
 
     # test error generate config
+    messages = [{"role": "user", "content": "你好"}]
     with pytest.raises(RuntimeError):
-        model.chat("你好", generate_config={"max_tokens": 99999999999999999})
+        model.chat(messages, generate_config={"max_tokens": 99999999999999999})
 
     with pytest.raises(RuntimeError):
-        model.chat("你好", generate_config={"stream_interval": 0})
+        model.chat(messages, generate_config={"stream_interval": 0})
 
     # test error with other correct requests
     thread1 = InferenceThread("1+1=3正确吗？", {"stream": True}, client, model)

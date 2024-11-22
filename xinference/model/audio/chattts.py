@@ -11,9 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import base64
 import logging
 from io import BytesIO
 from typing import TYPE_CHECKING, Optional
+
+from ..utils import set_all_random_seed
 
 if TYPE_CHECKING:
     from .core import AudioModelFamilyV1
@@ -37,48 +41,108 @@ class ChatTTSModel:
         self._model = None
         self._kwargs = kwargs
 
-    def load(self):
-        import torch
+    @property
+    def model_ability(self):
+        return self._model_spec.model_ability
 
-        from xinference.thirdparty import ChatTTS
+    def load(self):
+        import ChatTTS
+        import torch
 
         torch._dynamo.config.cache_size_limit = 64
         torch._dynamo.config.suppress_errors = True
         torch.set_float32_matmul_precision("high")
         self._model = ChatTTS.Chat()
-        self._model.load_models(
-            source="local", local_path=self._model_path, compile=True
+        logger.info("Load ChatTTS model with kwargs: %s", self._kwargs)
+        ok = self._model.load(
+            source="custom", custom_path=self._model_path, **self._kwargs
         )
+        if not ok:
+            raise Exception(f"The ChatTTS model is not correct: {self._model_path}")
 
     def speech(
-        self, input: str, voice: str, response_format: str = "mp3", speed: float = 1.0
+        self,
+        input: str,
+        voice: str,
+        response_format: str = "mp3",
+        speed: float = 1.0,
+        stream: bool = False,
     ):
+        import ChatTTS
         import numpy as np
         import torch
         import torchaudio
         import xxhash
 
-        seed = xxhash.xxh32_intdigest(voice)
+        rnd_spk_emb = None
 
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        torch.cuda.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        if len(voice) > 400:
+            try:
+                assert self._model is not None
+                b = base64.b64decode(voice)
+                bio = BytesIO(b)
+                tensor = torch.load(bio, map_location="cpu")
+                rnd_spk_emb = self._model._encode_spk_emb(tensor)
+                logger.info("Speech by input speaker")
+            except Exception as e:
+                logger.info("Fallback to random speaker due to %s", e)
 
-        assert self._model is not None
-        rnd_spk_emb = self._model.sample_random_speaker()
+        if rnd_spk_emb is None:
+            seed = xxhash.xxh32_intdigest(voice)
+
+            set_all_random_seed(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+            assert self._model is not None
+            rnd_spk_emb = self._model.sample_random_speaker()
+            logger.info("Speech by voice %s", voice)
 
         default = 5
         infer_speed = int(default * speed)
-        params_infer_code = {"spk_emb": rnd_spk_emb, "prompt": f"[speed_{infer_speed}]"}
+        params_infer_code = ChatTTS.Chat.InferCodeParams(
+            prompt=f"[speed_{infer_speed}]", spk_emb=rnd_spk_emb
+        )
 
         assert self._model is not None
-        wavs = self._model.infer([input], params_infer_code=params_infer_code)
-
-        # Save the generated audio
-        with BytesIO() as out:
-            torchaudio.save(
-                out, torch.from_numpy(wavs[0]), 24000, format=response_format
+        if stream:
+            iter = self._model.infer(
+                [input], params_infer_code=params_infer_code, stream=True
             )
-            return out.getvalue()
+
+            def _generator():
+                with BytesIO() as out:
+                    writer = torchaudio.io.StreamWriter(out, format=response_format)
+                    writer.add_audio_stream(sample_rate=24000, num_channels=1)
+                    i = 0
+                    last_pos = 0
+                    with writer.open():
+                        for it in iter:
+                            for chunk in it:
+                                chunk = np.array([chunk]).transpose()
+                                writer.write_audio_chunk(i, torch.from_numpy(chunk))
+                                new_last_pos = out.tell()
+                                if new_last_pos != last_pos:
+                                    out.seek(last_pos)
+                                    encoded_bytes = out.read()
+                                    yield encoded_bytes
+                                    last_pos = new_last_pos
+
+            return _generator()
+        else:
+            wavs = self._model.infer([input], params_infer_code=params_infer_code)
+
+            # Save the generated audio
+            with BytesIO() as out:
+                try:
+                    torchaudio.save(
+                        out,
+                        torch.from_numpy(wavs[0]).unsqueeze(0),
+                        24000,
+                        format=response_format,
+                    )
+                except:
+                    torchaudio.save(
+                        out, torch.from_numpy(wavs[0]), 24000, format=response_format
+                    )
+                return out.getvalue()

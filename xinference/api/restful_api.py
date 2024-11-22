@@ -46,25 +46,29 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from sse_starlette.sse import EventSourceResponse
 from starlette.responses import JSONResponse as StarletteJSONResponse
-from starlette.responses import RedirectResponse
+from starlette.responses import PlainTextResponse, RedirectResponse
 from uvicorn import Config, Server
 from xoscar.utils import get_next_port
 
 from .._compat import BaseModel, Field
 from .._version import get_versions
-from ..constants import XINFERENCE_DEFAULT_ENDPOINT_PORT, XINFERENCE_DISABLE_METRICS
+from ..constants import (
+    XINFERENCE_DEFAULT_CANCEL_BLOCK_DURATION,
+    XINFERENCE_DEFAULT_ENDPOINT_PORT,
+    XINFERENCE_DISABLE_METRICS,
+)
 from ..core.event import Event, EventCollectorActor, EventType
 from ..core.supervisor import SupervisorActor
-from ..core.utils import json_dumps
+from ..core.utils import CancelMixin, json_dumps
 from ..types import (
-    SPECIAL_TOOL_PROMPT,
     ChatCompletion,
-    ChatCompletionMessage,
     Completion,
     CreateChatCompletion,
     CreateCompletion,
     ImageList,
     PeftModelConfig,
+    SDAPIResult,
+    VideoList,
     max_tokens_field,
 )
 from .oauth2.auth_service import AuthService
@@ -109,7 +113,9 @@ class RerankRequest(BaseModel):
     documents: List[str]
     top_n: Optional[int] = None
     return_documents: Optional[bool] = False
+    return_len: Optional[bool] = False
     max_chunks_per_doc: Optional[int] = None
+    kwargs: Optional[str] = None
 
 
 class TextToImageRequest(BaseModel):
@@ -122,16 +128,64 @@ class TextToImageRequest(BaseModel):
     user: Optional[str] = None
 
 
+class SDAPIOptionsRequest(BaseModel):
+    sd_model_checkpoint: Optional[str] = None
+
+
+class SDAPITxt2imgRequst(BaseModel):
+    model: Optional[str]
+    prompt: Optional[str] = ""
+    negative_prompt: Optional[str] = ""
+    steps: Optional[int] = None
+    seed: Optional[int] = -1
+    cfg_scale: Optional[float] = 7.0
+    override_settings: Optional[dict] = {}
+    width: Optional[int] = 512
+    height: Optional[int] = 512
+    sampler_name: Optional[str] = None
+    denoising_strength: Optional[float] = None
+    kwargs: Optional[str] = None
+    user: Optional[str] = None
+
+
+class SDAPIImg2imgRequst(BaseModel):
+    model: Optional[str]
+    init_images: Optional[list]
+    prompt: Optional[str] = ""
+    negative_prompt: Optional[str] = ""
+    steps: Optional[int] = None
+    seed: Optional[int] = -1
+    cfg_scale: Optional[float] = 7.0
+    override_settings: Optional[dict] = {}
+    width: Optional[int] = 512
+    height: Optional[int] = 512
+    sampler_name: Optional[str] = None
+    denoising_strength: Optional[float] = None
+    kwargs: Optional[str] = None
+    user: Optional[str] = None
+
+
+class TextToVideoRequest(BaseModel):
+    model: str
+    prompt: Union[str, List[str]] = Field(description="The input to embed.")
+    n: Optional[int] = 1
+    kwargs: Optional[str] = None
+    user: Optional[str] = None
+
+
 class SpeechRequest(BaseModel):
     model: str
     input: str
     voice: Optional[str]
     response_format: Optional[str] = "mp3"
     speed: Optional[float] = 1.0
+    stream: Optional[bool] = False
+    kwargs: Optional[str] = None
 
 
 class RegisterModelRequest(BaseModel):
     model: str
+    worker_ip: Optional[str]
     persist: bool
 
 
@@ -152,11 +206,12 @@ class BuildGradioImageInterfaceRequest(BaseModel):
     model_name: str
     model_family: str
     model_id: str
-    controlnet: Union[None, List[Dict[str, Union[str, None]]]]
+    controlnet: Union[None, List[Dict[str, Union[str, dict, None]]]]
     model_revision: str
+    model_ability: List[str]
 
 
-class RESTfulAPI:
+class RESTfulAPI(CancelMixin):
     def __init__(
         self,
         supervisor_address: str,
@@ -185,14 +240,14 @@ class RESTfulAPI:
     async def _get_supervisor_ref(self) -> xo.ActorRefType[SupervisorActor]:
         if self._supervisor_ref is None:
             self._supervisor_ref = await xo.actor_ref(
-                address=self._supervisor_address, uid=SupervisorActor.uid()
+                address=self._supervisor_address, uid=SupervisorActor.default_uid()
             )
         return self._supervisor_ref
 
     async def _get_event_collector_ref(self) -> xo.ActorRefType[EventCollectorActor]:
         if self._event_collector_ref is None:
             self._event_collector_ref = await xo.actor_ref(
-                address=self._supervisor_address, uid=EventCollectorActor.uid()
+                address=self._supervisor_address, uid=EventCollectorActor.default_uid()
             )
         return self._event_collector_ref
 
@@ -231,6 +286,13 @@ class RESTfulAPI:
             allow_headers=["*"],
         )
 
+        @self._app.exception_handler(500)
+        async def internal_exception_handler(request: Request, exc: Exception):
+            logger.exception("Handling request %s failed: %s", request.url, exc)
+            return PlainTextResponse(
+                status_code=500, content=f"Internal Server Error: {exc}"
+            )
+
         # internal interface
         self._router.add_api_route("/status", self.get_status, methods=["GET"])
         # conflict with /v1/models/{model_uid} below, so register this first
@@ -246,13 +308,34 @@ class RESTfulAPI:
             methods=["GET"],
         )
         self._router.add_api_route(
-            "/v1/cluster/info", self.get_cluster_device_info, methods=["GET"]
+            "/v1/cluster/info",
+            self.get_cluster_device_info,
+            methods=["GET"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["admin"])]
+                if self.is_authenticated()
+                else None
+            ),
         )
         self._router.add_api_route(
-            "/v1/cluster/version", self.get_cluster_version, methods=["GET"]
+            "/v1/cluster/version",
+            self.get_cluster_version,
+            methods=["GET"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["admin"])]
+                if self.is_authenticated()
+                else None
+            ),
         )
         self._router.add_api_route(
-            "/v1/cluster/devices", self._get_devices_count, methods=["GET"]
+            "/v1/cluster/devices",
+            self._get_devices_count,
+            methods=["GET"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:list"])]
+                if self.is_authenticated()
+                else None
+            ),
         )
         self._router.add_api_route("/v1/address", self.get_address, methods=["GET"])
 
@@ -447,6 +530,16 @@ class RESTfulAPI:
             ),
         )
         self._router.add_api_route(
+            "/v1/requests/{request_id}/progress",
+            self.get_progress,
+            methods=["get"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
             "/v1/images/generations",
             self.create_images,
             methods=["POST"],
@@ -469,10 +562,105 @@ class RESTfulAPI:
             ),
         )
         self._router.add_api_route(
+            "/v1/images/inpainting",
+            self.create_inpainting,
+            methods=["POST"],
+            response_model=ImageList,
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/v1/images/ocr",
+            self.create_ocr,
+            methods=["POST"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        # SD WebUI API
+        self._router.add_api_route(
+            "/sdapi/v1/options",
+            self.sdapi_options,
+            methods=["POST"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/sdapi/v1/sd-models",
+            self.sdapi_sd_models,
+            methods=["GET"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/sdapi/v1/samplers",
+            self.sdapi_samplers,
+            methods=["GET"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/sdapi/v1/txt2img",
+            self.sdapi_txt2img,
+            methods=["POST"],
+            response_model=SDAPIResult,
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/sdapi/v1/img2img",
+            self.sdapi_img2img,
+            methods=["POST"],
+            response_model=SDAPIResult,
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/v1/video/generations",
+            self.create_videos,
+            methods=["POST"],
+            response_model=VideoList,
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
             "/v1/chat/completions",
             self.create_chat_completion,
             methods=["POST"],
             response_model=ChatCompletion,
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/v1/flexible/infers",
+            self.create_flexible_infer,
+            methods=["POST"],
             dependencies=(
                 [Security(self._auth_service, scopes=["models:read"])]
                 if self.is_authenticated()
@@ -547,6 +735,36 @@ class RESTfulAPI:
             methods=["DELETE"],
             dependencies=(
                 [Security(self._auth_service, scopes=["cache:delete"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/v1/workers",
+            self.get_workers_info,
+            methods=["GET"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["admin"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/v1/supervisor",
+            self.get_supervisor_info,
+            methods=["GET"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["admin"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/v1/clusters",
+            self.abort_cluster,
+            methods=["DELETE"],
+            dependencies=(
+                [Security(self._auth_service, scopes=["admin"])]
                 if self.is_authenticated()
                 else None
             ),
@@ -720,6 +938,8 @@ class RESTfulAPI:
         peft_model_config = payload.get("peft_model_config", None)
         worker_ip = payload.get("worker_ip", None)
         gpu_idx = payload.get("gpu_idx", None)
+        download_hub = payload.get("download_hub", None)
+        model_path = payload.get("model_path", None)
 
         exclude_keys = {
             "model_uid",
@@ -735,6 +955,8 @@ class RESTfulAPI:
             "peft_model_config",
             "worker_ip",
             "gpu_idx",
+            "download_hub",
+            "model_path",
         }
 
         kwargs = {
@@ -782,9 +1004,10 @@ class RESTfulAPI:
                 peft_model_config=peft_model_config,
                 worker_ip=worker_ip,
                 gpu_idx=gpu_idx,
+                download_hub=download_hub,
+                model_path=model_path,
                 **kwargs,
             )
-
         except ValueError as ve:
             logger.error(str(ve), exc_info=True)
             raise HTTPException(status_code=400, detail=str(ve))
@@ -943,6 +1166,7 @@ class RESTfulAPI:
                 model_revision=body.model_revision,
                 controlnet=body.controlnet,
                 access_token=access_token,
+                model_ability=body.model_ability,
             ).build()
 
             gr.mount_gradio_app(self._app, interface, f"/{model_uid}")
@@ -981,7 +1205,8 @@ class RESTfulAPI:
         return JSONResponse(content=self._supervisor_address)
 
     async def create_completion(self, request: Request) -> Response:
-        body = CreateCompletionRequest.parse_obj(await request.json())
+        raw_body = await request.json()
+        body = CreateCompletionRequest.parse_obj(raw_body)
         exclude = {
             "prompt",
             "model",
@@ -991,6 +1216,7 @@ class RESTfulAPI:
             "logit_bias_type",
             "user",
         }
+        raw_kwargs = {k: v for k, v in raw_body.items() if k not in exclude}
         kwargs = body.dict(exclude_unset=True, exclude=exclude)
 
         # TODO: Decide if this default value override is necessary #1061
@@ -1020,7 +1246,9 @@ class RESTfulAPI:
                 iterator = None
                 try:
                     try:
-                        iterator = await model.generate(body.prompt, kwargs)
+                        iterator = await model.generate(
+                            body.prompt, kwargs, raw_params=raw_kwargs
+                        )
                     except RuntimeError as re:
                         self.handle_request_limit_error(re)
                     async for item in iterator:
@@ -1040,7 +1268,7 @@ class RESTfulAPI:
             return EventSourceResponse(stream_results())
         else:
             try:
-                data = await model.generate(body.prompt, kwargs)
+                data = await model.generate(body.prompt, kwargs, raw_params=raw_kwargs)
                 return Response(data, media_type="application/json")
             except Exception as e:
                 logger.error(e, exc_info=True)
@@ -1088,11 +1316,6 @@ class RESTfulAPI:
         payload = await request.json()
         body = RerankRequest.parse_obj(payload)
         model_uid = body.model
-        kwargs = {
-            key: value
-            for key, value in payload.items()
-            if key not in RerankRequest.__annotations__.keys()
-        }
 
         try:
             model = await (await self._get_supervisor_ref()).get_model(model_uid)
@@ -1106,13 +1329,18 @@ class RESTfulAPI:
             raise HTTPException(status_code=500, detail=str(e))
 
         try:
+            if body.kwargs is not None:
+                parsed_kwargs = json.loads(body.kwargs)
+            else:
+                parsed_kwargs = {}
             scores = await model.rerank(
                 body.documents,
                 body.query,
                 top_n=body.top_n,
                 max_chunks_per_doc=body.max_chunks_per_doc,
                 return_documents=body.return_documents,
-                **kwargs,
+                return_len=body.return_len,
+                **parsed_kwargs,
             )
             return Response(scores, media_type="application/json")
         except RuntimeError as re:
@@ -1227,8 +1455,18 @@ class RESTfulAPI:
             await self._report_error_event(model_uid, str(e))
             raise HTTPException(status_code=500, detail=str(e))
 
-    async def create_speech(self, request: Request) -> Response:
-        body = SpeechRequest.parse_obj(await request.json())
+    async def create_speech(
+        self,
+        request: Request,
+        prompt_speech: Optional[UploadFile] = File(
+            None, media_type="application/octet-stream"
+        ),
+    ) -> Response:
+        if prompt_speech:
+            f = await request.form()
+        else:
+            f = await request.json()
+        body = SpeechRequest.parse_obj(f)
         model_uid = body.model
         try:
             model = await (await self._get_supervisor_ref()).get_model(model_uid)
@@ -1242,13 +1480,26 @@ class RESTfulAPI:
             raise HTTPException(status_code=500, detail=str(e))
 
         try:
+            if body.kwargs is not None:
+                parsed_kwargs = json.loads(body.kwargs)
+            else:
+                parsed_kwargs = {}
+            if prompt_speech is not None:
+                parsed_kwargs["prompt_speech"] = await prompt_speech.read()
             out = await model.speech(
                 input=body.input,
                 voice=body.voice,
                 response_format=body.response_format,
                 speed=body.speed,
+                stream=body.stream,
+                **parsed_kwargs,
             )
-            return Response(media_type="application/octet-stream", content=out)
+            if body.stream:
+                return EventSourceResponse(
+                    media_type="application/octet-stream", content=out
+                )
+            else:
+                return Response(media_type="application/octet-stream", content=out)
         except RuntimeError as re:
             logger.error(re, exc_info=True)
             await self._report_error_event(model_uid, str(re))
@@ -1257,6 +1508,17 @@ class RESTfulAPI:
         except Exception as e:
             logger.error(e, exc_info=True)
             await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def get_progress(self, request_id: str) -> JSONResponse:
+        try:
+            supervisor_ref = await self._get_supervisor_ref()
+            result = {"progress": await supervisor_ref.get_progress(request_id)}
+            return JSONResponse(content=result)
+        except KeyError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error(e, exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
     async def create_images(self, request: Request) -> Response:
@@ -1273,13 +1535,133 @@ class RESTfulAPI:
             await self._report_error_event(model_uid, str(e))
             raise HTTPException(status_code=500, detail=str(e))
 
+        request_id = None
         try:
             kwargs = json.loads(body.kwargs) if body.kwargs else {}
+            request_id = kwargs.get("request_id")
+            self._add_running_task(request_id)
             image_list = await model.text_to_image(
                 prompt=body.prompt,
                 n=body.n,
                 size=body.size,
                 response_format=body.response_format,
+                **kwargs,
+            )
+            return Response(content=image_list, media_type="application/json")
+        except asyncio.CancelledError:
+            err_str = f"The request has been cancelled: {request_id}"
+            logger.error(err_str)
+            await self._report_error_event(model_uid, err_str)
+            raise HTTPException(status_code=409, detail=err_str)
+        except RuntimeError as re:
+            logger.error(re, exc_info=True)
+            await self._report_error_event(model_uid, str(re))
+            self.handle_request_limit_error(re)
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def sdapi_options(self, request: Request) -> Response:
+        body = SDAPIOptionsRequest.parse_obj(await request.json())
+        model_uid = body.sd_model_checkpoint
+
+        try:
+            if not model_uid:
+                raise ValueError("Unknown model")
+            await (await self._get_supervisor_ref()).get_model(model_uid)
+            return Response()
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            await self._report_error_event(model_uid, str(ve))
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def sdapi_sd_models(self, request: Request) -> Response:
+        try:
+            models = await (await self._get_supervisor_ref()).list_models()
+            sd_models = []
+            for model_name, info in models.items():
+                if info["model_type"] != "image":
+                    continue
+                sd_models.append({"model_name": model_name, "config": None})
+            return JSONResponse(content=sd_models)
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def sdapi_samplers(self, request: Request) -> Response:
+        try:
+            from ..model.image.stable_diffusion.core import SAMPLING_METHODS
+
+            samplers = [
+                {"name": sample_method, "alias": [], "options": {}}
+                for sample_method in SAMPLING_METHODS
+            ]
+            return JSONResponse(content=samplers)
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def sdapi_txt2img(self, request: Request) -> Response:
+        body = SDAPITxt2imgRequst.parse_obj(await request.json())
+        model_uid = body.model or body.override_settings.get("sd_model_checkpoint")
+
+        try:
+            if not model_uid:
+                raise ValueError("Unknown model")
+            model = await (await self._get_supervisor_ref()).get_model(model_uid)
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            await self._report_error_event(model_uid, str(ve))
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+        try:
+            kwargs = dict(body)
+            kwargs.update(json.loads(body.kwargs) if body.kwargs else {})
+            image_list = await model.txt2img(
+                **kwargs,
+            )
+            return Response(content=image_list, media_type="application/json")
+        except RuntimeError as re:
+            logger.error(re, exc_info=True)
+            await self._report_error_event(model_uid, str(re))
+            self.handle_request_limit_error(re)
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def sdapi_img2img(self, request: Request) -> Response:
+        body = SDAPIImg2imgRequst.parse_obj(await request.json())
+        model_uid = body.model or body.override_settings.get("sd_model_checkpoint")
+
+        try:
+            if not model_uid:
+                raise ValueError("Unknown model")
+            model = await (await self._get_supervisor_ref()).get_model(model_uid)
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            await self._report_error_event(model_uid, str(ve))
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+        try:
+            kwargs = dict(body)
+            kwargs.update(json.loads(body.kwargs) if body.kwargs else {})
+            image_list = await model.img2img(
                 **kwargs,
             )
             return Response(content=image_list, media_type="application/json")
@@ -1301,7 +1683,7 @@ class RESTfulAPI:
         negative_prompt: Optional[Union[str, List[str]]] = Form(None),
         n: Optional[int] = Form(1),
         response_format: Optional[str] = Form("url"),
-        size: Optional[str] = Form("1024*1024"),
+        size: Optional[str] = Form(None),
         kwargs: Optional[str] = Form(None),
     ) -> Response:
         model_uid = model
@@ -1316,11 +1698,14 @@ class RESTfulAPI:
             await self._report_error_event(model_uid, str(e))
             raise HTTPException(status_code=500, detail=str(e))
 
+        request_id = None
         try:
             if kwargs is not None:
                 parsed_kwargs = json.loads(kwargs)
             else:
                 parsed_kwargs = {}
+            request_id = parsed_kwargs.get("request_id")
+            self._add_running_task(request_id)
             image_list = await model_ref.image_to_image(
                 image=Image.open(image.file),
                 prompt=prompt,
@@ -1331,6 +1716,11 @@ class RESTfulAPI:
                 **parsed_kwargs,
             )
             return Response(content=image_list, media_type="application/json")
+        except asyncio.CancelledError:
+            err_str = f"The request has been cancelled: {request_id}"
+            logger.error(err_str)
+            await self._report_error_event(model_uid, err_str)
+            raise HTTPException(status_code=409, detail=err_str)
         except RuntimeError as re:
             logger.error(re, exc_info=True)
             await self._report_error_event(model_uid, str(re))
@@ -1340,8 +1730,183 @@ class RESTfulAPI:
             await self._report_error_event(model_uid, str(e))
             raise HTTPException(status_code=500, detail=str(e))
 
+    async def create_inpainting(
+        self,
+        model: str = Form(...),
+        image: UploadFile = File(media_type="application/octet-stream"),
+        mask_image: UploadFile = File(media_type="application/octet-stream"),
+        prompt: Optional[Union[str, List[str]]] = Form(None),
+        negative_prompt: Optional[Union[str, List[str]]] = Form(None),
+        n: Optional[int] = Form(1),
+        response_format: Optional[str] = Form("url"),
+        size: Optional[str] = Form(None),
+        kwargs: Optional[str] = Form(None),
+    ) -> Response:
+        model_uid = model
+        try:
+            model_ref = await (await self._get_supervisor_ref()).get_model(model_uid)
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            await self._report_error_event(model_uid, str(ve))
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+        request_id = None
+        try:
+            if kwargs is not None:
+                parsed_kwargs = json.loads(kwargs)
+            else:
+                parsed_kwargs = {}
+            request_id = parsed_kwargs.get("request_id")
+            self._add_running_task(request_id)
+            im = Image.open(image.file)
+            mask_im = Image.open(mask_image.file)
+            if not size:
+                w, h = im.size
+                size = f"{w}*{h}"
+            image_list = await model_ref.inpainting(
+                image=im,
+                mask_image=mask_im,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                n=n,
+                size=size,
+                response_format=response_format,
+                **parsed_kwargs,
+            )
+            return Response(content=image_list, media_type="application/json")
+        except asyncio.CancelledError:
+            err_str = f"The request has been cancelled: {request_id}"
+            logger.error(err_str)
+            await self._report_error_event(model_uid, err_str)
+            raise HTTPException(status_code=409, detail=err_str)
+        except RuntimeError as re:
+            logger.error(re, exc_info=True)
+            await self._report_error_event(model_uid, str(re))
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def create_ocr(
+        self,
+        model: str = Form(...),
+        image: UploadFile = File(media_type="application/octet-stream"),
+        kwargs: Optional[str] = Form(None),
+    ) -> Response:
+        model_uid = model
+        try:
+            model_ref = await (await self._get_supervisor_ref()).get_model(model_uid)
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            await self._report_error_event(model_uid, str(ve))
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+        request_id = None
+        try:
+            if kwargs is not None:
+                parsed_kwargs = json.loads(kwargs)
+            else:
+                parsed_kwargs = {}
+            request_id = parsed_kwargs.get("request_id")
+            self._add_running_task(request_id)
+            im = Image.open(image.file)
+            text = await model_ref.ocr(
+                image=im,
+                **parsed_kwargs,
+            )
+            return Response(content=text, media_type="text/plain")
+        except asyncio.CancelledError:
+            err_str = f"The request has been cancelled: {request_id}"
+            logger.error(err_str)
+            await self._report_error_event(model_uid, err_str)
+            raise HTTPException(status_code=409, detail=err_str)
+        except RuntimeError as re:
+            logger.error(re, exc_info=True)
+            await self._report_error_event(model_uid, str(re))
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def create_flexible_infer(self, request: Request) -> Response:
+        payload = await request.json()
+
+        model_uid = payload.get("model")
+
+        exclude = {
+            "model",
+        }
+        kwargs = {key: value for key, value in payload.items() if key not in exclude}
+
+        try:
+            model = await (await self._get_supervisor_ref()).get_model(model_uid)
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            await self._report_error_event(model_uid, str(ve))
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+        try:
+            result = await model.infer(**kwargs)
+            return Response(result, media_type="application/json")
+        except RuntimeError as re:
+            logger.error(re, exc_info=True)
+            await self._report_error_event(model_uid, str(re))
+            self.handle_request_limit_error(re)
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def create_videos(self, request: Request) -> Response:
+        body = TextToVideoRequest.parse_obj(await request.json())
+        model_uid = body.model
+        try:
+            model = await (await self._get_supervisor_ref()).get_model(model_uid)
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            await self._report_error_event(model_uid, str(ve))
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+        try:
+            kwargs = json.loads(body.kwargs) if body.kwargs else {}
+            video_list = await model.text_to_video(
+                prompt=body.prompt,
+                n=body.n,
+                **kwargs,
+            )
+            return Response(content=video_list, media_type="application/json")
+        except RuntimeError as re:
+            logger.error(re, exc_info=True)
+            await self._report_error_event(model_uid, str(re))
+            self.handle_request_limit_error(re)
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
     async def create_chat_completion(self, request: Request) -> Response:
-        body = CreateChatCompletion.parse_obj(await request.json())
+        raw_body = await request.json()
+        body = CreateChatCompletion.parse_obj(raw_body)
         exclude = {
             "prompt",
             "model",
@@ -1351,6 +1916,7 @@ class RESTfulAPI:
             "logit_bias_type",
             "user",
         }
+        raw_kwargs = {k: v for k, v in raw_body.items() if k not in exclude}
         kwargs = body.dict(exclude_unset=True, exclude=exclude)
 
         # TODO: Decide if this default value override is necessary #1061
@@ -1367,33 +1933,7 @@ class RESTfulAPI:
                 status_code=400, detail="Invalid input. Please specify the prompt."
             )
 
-        system_messages: List["ChatCompletionMessage"] = []
-        system_messages_contents = []
-        non_system_messages = []
-        for msg in messages:
-            assert (
-                msg.get("content") != SPECIAL_TOOL_PROMPT
-            ), f"Invalid message content {SPECIAL_TOOL_PROMPT}"
-            if msg["role"] == "system":
-                system_messages_contents.append(msg["content"])
-            else:
-                non_system_messages.append(msg)
-        system_messages.append(
-            {"role": "system", "content": ". ".join(system_messages_contents)}
-        )
-
         has_tool_message = messages[-1].get("role") == "tool"
-        if has_tool_message:
-            prompt = SPECIAL_TOOL_PROMPT
-            system_prompt = system_messages[0]["content"] if system_messages else None
-            chat_history = non_system_messages  # exclude the prompt
-        else:
-            prompt = None
-            if non_system_messages:
-                prompt = non_system_messages[-1]["content"]
-            system_prompt = system_messages[0]["content"] if system_messages else None
-            chat_history = non_system_messages[:-1]  # exclude the prompt
-
         model_uid = body.model
 
         try:
@@ -1418,24 +1958,16 @@ class RESTfulAPI:
             await self._report_error_event(model_uid, str(e))
             raise HTTPException(status_code=500, detail=str(e))
 
+        from ..model.llm.utils import (
+            GLM4_TOOL_CALL_FAMILY,
+            LLAMA3_TOOL_CALL_FAMILY,
+            QWEN_TOOL_CALL_FAMILY,
+        )
+
         model_family = desc.get("model_family", "")
-        function_call_models = [
-            "chatglm3",
-            "glm4-chat",
-            "gorilla-openfunctions-v1",
-            "qwen-chat",
-            "qwen1.5-chat",
-            "qwen1.5-moe-chat",
-            "qwen2-instruct",
-            "qwen2-moe-instruct",
-        ]
-
-        is_qwen = desc.get("model_format") == "ggmlv3" and "qwen-chat" == model_family
-
-        if is_qwen and system_prompt is not None:
-            raise HTTPException(
-                status_code=400, detail="Qwen ggml does not have system prompt"
-            )
+        function_call_models = (
+            QWEN_TOOL_CALL_FAMILY + GLM4_TOOL_CALL_FAMILY + LLAMA3_TOOL_CALL_FAMILY
+        )
 
         if model_family not in function_call_models:
             if body.tools:
@@ -1450,16 +1982,15 @@ class RESTfulAPI:
                 )
         if body.tools and body.stream:
             is_vllm = await model.is_vllm_backend()
-            if not is_vllm or model_family not in [
-                "qwen-chat",
-                "qwen1.5-chat",
-                "qwen1.5-moe-chat",
-                "qwen2-instruct",
-                "qwen2-moe-instruct",
-            ]:
+
+            if not (
+                (is_vllm and model_family in QWEN_TOOL_CALL_FAMILY)
+                or (not is_vllm and model_family in GLM4_TOOL_CALL_FAMILY)
+            ):
                 raise HTTPException(
                     status_code=400,
-                    detail="Streaming support for tool calls is available only when using vLLM backend and Qwen models.",
+                    detail="Streaming support for tool calls is available only when using "
+                    "Qwen models with vLLM backend or GLM4-chat models without vLLM backend.",
                 )
 
         if body.stream:
@@ -1468,12 +1999,11 @@ class RESTfulAPI:
                 iterator = None
                 try:
                     try:
-                        if is_qwen:
-                            iterator = await model.chat(prompt, chat_history, kwargs)
-                        else:
-                            iterator = await model.chat(
-                                prompt, system_prompt, chat_history, kwargs
-                            )
+                        iterator = await model.chat(
+                            messages,
+                            kwargs,
+                            raw_params=raw_kwargs,
+                        )
                     except RuntimeError as re:
                         await self._report_error_event(model_uid, str(re))
                         self.handle_request_limit_error(re)
@@ -1501,10 +2031,11 @@ class RESTfulAPI:
             return EventSourceResponse(stream_results())
         else:
             try:
-                if is_qwen:
-                    data = await model.chat(prompt, chat_history, kwargs)
-                else:
-                    data = await model.chat(prompt, system_prompt, chat_history, kwargs)
+                data = await model.chat(
+                    messages,
+                    kwargs,
+                    raw_params=raw_kwargs,
+                )
                 return Response(content=data, media_type="application/json")
             except Exception as e:
                 logger.error(e, exc_info=True)
@@ -1528,11 +2059,12 @@ class RESTfulAPI:
     async def register_model(self, model_type: str, request: Request) -> JSONResponse:
         body = RegisterModelRequest.parse_obj(await request.json())
         model = body.model
+        worker_ip = body.worker_ip
         persist = body.persist
 
         try:
             await (await self._get_supervisor_ref()).register_model(
-                model_type, model, persist
+                model_type, model, persist, worker_ip
             )
         except ValueError as re:
             logger.error(re, exc_info=True)
@@ -1615,10 +2147,25 @@ class RESTfulAPI:
             logger.error(e, exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
-    async def abort_request(self, model_uid: str, request_id: str) -> JSONResponse:
+    async def abort_request(
+        self, request: Request, model_uid: str, request_id: str
+    ) -> JSONResponse:
         try:
+            payload = await request.json()
+            block_duration = payload.get(
+                "block_duration", XINFERENCE_DEFAULT_CANCEL_BLOCK_DURATION
+            )
+            logger.info(
+                "Abort request with model uid: %s, request id: %s, block duration: %s",
+                model_uid,
+                request_id,
+                block_duration,
+            )
             supervisor_ref = await self._get_supervisor_ref()
-            res = await supervisor_ref.abort_request(model_uid, request_id)
+            res = await supervisor_ref.abort_request(
+                model_uid, request_id, block_duration
+            )
+            self._cancel_running_task(request_id, block_duration)
             return JSONResponse(content=res)
         except Exception as e:
             logger.error(e, exc_info=True)
@@ -1687,6 +2234,43 @@ class RESTfulAPI:
             res = await (await self._get_supervisor_ref()).confirm_and_remove_model(
                 model_version=model_version, worker_ip=worker_ip
             )
+            return JSONResponse(content={"result": res})
+        except ValueError as re:
+            logger.error(re, exc_info=True)
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def get_workers_info(self) -> JSONResponse:
+        try:
+            res = await (await self._get_supervisor_ref()).get_workers_info()
+            return JSONResponse(content=res)
+        except ValueError as re:
+            logger.error(re, exc_info=True)
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def get_supervisor_info(self) -> JSONResponse:
+        try:
+            res = await (await self._get_supervisor_ref()).get_supervisor_info()
+            return res
+        except ValueError as re:
+            logger.error(re, exc_info=True)
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def abort_cluster(self) -> JSONResponse:
+        import os
+        import signal
+
+        try:
+            res = await (await self._get_supervisor_ref()).abort_cluster()
+            os.kill(os.getpid(), signal.SIGINT)
             return JSONResponse(content={"result": res})
         except ValueError as re:
             logger.error(re, exc_info=True)

@@ -14,8 +14,6 @@
 
 import logging
 import os
-import platform
-import shutil
 from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 
@@ -34,6 +32,7 @@ from ..._compat import (
 )
 from ...constants import (
     XINFERENCE_CACHE_DIR,
+    XINFERENCE_CSG_ENDPOINT,
     XINFERENCE_ENV_CSG_TOKEN,
     XINFERENCE_MODEL_DIR,
 )
@@ -42,6 +41,7 @@ from ..utils import (
     create_symlink,
     download_from_csghub,
     download_from_modelscope,
+    download_from_openmind_hub,
     is_valid_model_uri,
     parse_uri,
     retry_download,
@@ -53,14 +53,14 @@ from . import LLM
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONTEXT_LENGTH = 2048
-BUILTIN_LLM_PROMPT_STYLE: Dict[str, "PromptStyleV1"] = {}
+BUILTIN_LLM_PROMPT_STYLE: Dict[str, Dict[str, Any]] = {}
 BUILTIN_LLM_MODEL_CHAT_FAMILIES: Set[str] = set()
 BUILTIN_LLM_MODEL_GENERATE_FAMILIES: Set[str] = set()
 BUILTIN_LLM_MODEL_TOOL_CALL_FAMILIES: Set[str] = set()
 
 
-class GgmlLLMSpecV1(BaseModel):
-    model_format: Literal["ggmlv3", "ggufv2"]
+class LlamaCppLLMSpecV1(BaseModel):
+    model_format: Literal["ggufv2"]
     # Must in order that `str` first, then `int`
     model_size_in_billions: Union[str, int]
     quantizations: List[str]
@@ -85,7 +85,7 @@ class GgmlLLMSpecV1(BaseModel):
 
 
 class PytorchLLMSpecV1(BaseModel):
-    model_format: Literal["pytorch", "gptq", "awq"]
+    model_format: Literal["pytorch", "gptq", "awq", "fp8"]
     # Must in order that `str` first, then `int`
     model_size_in_billions: Union[str, int]
     quantizations: List[str]
@@ -106,14 +106,26 @@ class PytorchLLMSpecV1(BaseModel):
         return v
 
 
-class PromptStyleV1(BaseModel):
-    style_name: str
-    system_prompt: str = ""
-    roles: List[str]
-    intra_message_sep: str = ""
-    inter_message_sep: str = ""
-    stop: Optional[List[str]]
-    stop_token_ids: Optional[List[int]]
+class MLXLLMSpecV1(BaseModel):
+    model_format: Literal["mlx"]
+    # Must in order that `str` first, then `int`
+    model_size_in_billions: Union[str, int]
+    quantizations: List[str]
+    model_id: Optional[str]
+    model_hub: str = "huggingface"
+    model_uri: Optional[str]
+    model_revision: Optional[str]
+
+    @validator("model_size_in_billions", pre=False)
+    def validate_model_size_with_radix(cls, v: object) -> object:
+        if isinstance(v, str):
+            if (
+                "_" in v
+            ):  # for example, "1_8" just returns "1_8", otherwise int("1_8") returns 18
+                return v
+            else:
+                return int(v)
+        return v
 
 
 class LLMFamilyV1(BaseModel):
@@ -121,17 +133,19 @@ class LLMFamilyV1(BaseModel):
     context_length: Optional[int] = DEFAULT_CONTEXT_LENGTH
     model_name: str
     model_lang: List[str]
-    model_ability: List[Literal["embed", "generate", "chat", "tools", "vision"]]
+    model_ability: List[
+        Literal["embed", "generate", "chat", "tools", "vision", "audio"]
+    ]
     model_description: Optional[str]
     # reason for not required str here: legacy registration
     model_family: Optional[str]
     model_specs: List["LLMSpecV1"]
-    prompt_style: Optional["PromptStyleV1"]
+    chat_template: Optional[str]
+    stop_token_ids: Optional[List[int]]
+    stop: Optional[List[str]]
 
 
 class CustomLLMFamilyV1(LLMFamilyV1):
-    prompt_style: Optional[Union["PromptStyleV1", str]]  # type: ignore
-
     @classmethod
     def parse_raw(
         cls: Any,
@@ -155,6 +169,11 @@ class CustomLLMFamilyV1(LLMFamilyV1):
         except (ValueError, TypeError, UnicodeDecodeError) as e:
             raise ValidationError([ErrorWrapper(e, loc=ROOT_KEY)], cls)
         llm_spec: CustomLLMFamilyV1 = cls.parse_obj(obj)
+        vision_model_names: Set[str] = {
+            family.model_name
+            for family in BUILTIN_LLM_FAMILIES
+            if "vision" in family.model_ability
+        }
 
         # check model_family
         if llm_spec.model_family is None:
@@ -162,61 +181,45 @@ class CustomLLMFamilyV1(LLMFamilyV1):
                 f"You must specify `model_family` when registering custom LLM models."
             )
         assert isinstance(llm_spec.model_family, str)
+        # TODO: Currently, tool call and vision models cannot be registered if it is not the builtin model_family
         if (
-            llm_spec.model_family != "other"
-            and "chat" in llm_spec.model_ability
-            and llm_spec.model_family not in BUILTIN_LLM_MODEL_CHAT_FAMILIES
-        ):
-            raise ValueError(
-                f"`model_family` for chat model must be `other` or one of the following values: \n"
-                f"{', '.join(list(BUILTIN_LLM_MODEL_CHAT_FAMILIES))}"
-            )
-        if (
-            llm_spec.model_family != "other"
-            and "tools" in llm_spec.model_ability
+            "tools" in llm_spec.model_ability
             and llm_spec.model_family not in BUILTIN_LLM_MODEL_TOOL_CALL_FAMILIES
         ):
             raise ValueError(
-                f"`model_family` for tool call model must be `other` or one of the following values: \n"
+                f"`model_family` for tool call model must be one of the following values: \n"
                 f"{', '.join(list(BUILTIN_LLM_MODEL_TOOL_CALL_FAMILIES))}"
             )
         if (
-            llm_spec.model_family != "other"
-            and "chat" not in llm_spec.model_ability
-            and llm_spec.model_family not in BUILTIN_LLM_MODEL_GENERATE_FAMILIES
+            "vision" in llm_spec.model_ability
+            and llm_spec.model_family not in vision_model_names
         ):
             raise ValueError(
-                f"`model_family` for generate model must be `other` or one of the following values: \n"
-                f"{', '.join(list(BUILTIN_LLM_MODEL_GENERATE_FAMILIES))}"
+                f"`model_family` for multimodal model must be one of the following values: \n"
+                f"{', '.join(list(vision_model_names))}"
             )
-        # set prompt style when it is the builtin model family
-        if (
-            llm_spec.prompt_style is None
-            and llm_spec.model_family != "other"
-            and "chat" in llm_spec.model_ability
-        ):
-            llm_spec.prompt_style = llm_spec.model_family
+        # set chat_template when it is the builtin model family
+        if llm_spec.chat_template is None and "chat" in llm_spec.model_ability:
+            llm_spec.chat_template = llm_spec.model_family
 
-        # handle prompt style when user choose existing style
-        if llm_spec.prompt_style is not None and isinstance(llm_spec.prompt_style, str):
-            prompt_style_name = llm_spec.prompt_style
-            if prompt_style_name not in BUILTIN_LLM_PROMPT_STYLE:
-                raise ValueError(
-                    f"Xinference does not support the prompt style name: {prompt_style_name}"
-                )
-            llm_spec.prompt_style = BUILTIN_LLM_PROMPT_STYLE[prompt_style_name]
+        # handle chat_template when user choose existing model_family
+        if (
+            llm_spec.chat_template is not None
+            and llm_spec.chat_template in BUILTIN_LLM_PROMPT_STYLE
+        ):
+            llm_spec.stop_token_ids = BUILTIN_LLM_PROMPT_STYLE[llm_spec.chat_template][
+                "stop_token_ids"
+            ]
+            llm_spec.stop = BUILTIN_LLM_PROMPT_STYLE[llm_spec.chat_template]["stop"]
+            llm_spec.chat_template = BUILTIN_LLM_PROMPT_STYLE[llm_spec.chat_template][
+                "chat_template"
+            ]
 
         # check model ability, registering LLM only provides generate and chat
         # but for vision models, we add back the abilities so that
         # gradio chat interface can be generated properly
         if (
-            llm_spec.model_family != "other"
-            and llm_spec.model_family
-            in {
-                family.model_name
-                for family in BUILTIN_LLM_FAMILIES
-                if "vision" in family.model_ability
-            }
+            llm_spec.model_family in vision_model_names
             and "vision" not in llm_spec.model_ability
         ):
             llm_spec.model_ability.append("vision")
@@ -225,7 +228,7 @@ class CustomLLMFamilyV1(LLMFamilyV1):
 
 
 LLMSpecV1 = Annotated[
-    Union[GgmlLLMSpecV1, PytorchLLMSpecV1],
+    Union[LlamaCppLLMSpecV1, PytorchLLMSpecV1, MLXLLMSpecV1],
     Field(discriminator="model_format"),
 ]
 
@@ -237,6 +240,7 @@ LLAMA_CLASSES: List[Type[LLM]] = []
 
 BUILTIN_LLM_FAMILIES: List["LLMFamilyV1"] = []
 BUILTIN_MODELSCOPE_LLM_FAMILIES: List["LLMFamilyV1"] = []
+BUILTIN_OPENMIND_HUB_LLM_FAMILIES: List["LLMFamilyV1"] = []
 BUILTIN_CSGHUB_LLM_FAMILIES: List["LLMFamilyV1"] = []
 
 SGLANG_CLASSES: List[Type[LLM]] = []
@@ -247,6 +251,10 @@ UD_LLM_FAMILIES: List["LLMFamilyV1"] = []
 UD_LLM_FAMILIES_LOCK = Lock()
 
 VLLM_CLASSES: List[Type[LLM]] = []
+
+MLX_CLASSES: List[Type[LLM]] = []
+
+LMDEPLOY_CLASSES: List[Type[LLM]] = []
 
 LLM_ENGINES: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 SUPPORTED_ENGINES: Dict[str, List[Type[LLM]]] = {}
@@ -284,13 +292,10 @@ def cache(
     if os.path.exists(legacy_cache_path):
         logger.info("Legacy cache path exists: %s", legacy_cache_path)
         return os.path.dirname(legacy_cache_path)
-    elif download_from_self_hosted_storage() and is_self_hosted(llm_family, llm_spec):
-        logger.info(f"Caching from self-hosted storage")
-        return cache_from_self_hosted_storage(llm_family, llm_spec, quantization)
     else:
         if llm_spec.model_uri is not None:
             logger.info(f"Caching from URI: {llm_spec.model_uri}")
-            return cache_from_uri(llm_family, llm_spec, quantization)
+            return cache_from_uri(llm_family, llm_spec)
         else:
             if llm_spec.model_hub == "huggingface":
                 logger.info(f"Caching from Hugging Face: {llm_spec.model_id}")
@@ -298,6 +303,9 @@ def cache(
             elif llm_spec.model_hub == "modelscope":
                 logger.info(f"Caching from Modelscope: {llm_spec.model_id}")
                 return cache_from_modelscope(llm_family, llm_spec, quantization)
+            elif llm_spec.model_hub == "openmind_hub":
+                logger.info(f"Caching from openmind_hub: {llm_spec.model_id}")
+                return cache_from_openmind_hub(llm_family, llm_spec, quantization)
             elif llm_spec.model_hub == "csghub":
                 logger.info(f"Caching from CSGHub: {llm_spec.model_id}")
                 return cache_from_csghub(llm_family, llm_spec, quantization)
@@ -305,68 +313,10 @@ def cache(
                 raise ValueError(f"Unknown model hub: {llm_spec.model_hub}")
 
 
-SUPPORTED_SCHEMES = ["s3"]
-
-
-class AWSRegion:
-    def __init__(self, region: str):
-        self.region = region
-        self.original_aws_default_region = None
-
-    def __enter__(self):
-        if "AWS_DEFAULT_REGION" in os.environ:
-            self.original_aws_default_region = os.environ["AWS_DEFAULT_REGION"]
-        os.environ["AWS_DEFAULT_REGION"] = self.region
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self.original_aws_default_region:
-            os.environ["AWS_DEFAULT_REGION"] = self.original_aws_default_region
-        else:
-            del os.environ["AWS_DEFAULT_REGION"]
-
-
-def is_self_hosted(
-    llm_family: LLMFamilyV1,
-    llm_spec: "LLMSpecV1",
-):
-    from fsspec import AbstractFileSystem, filesystem
-
-    with AWSRegion("cn-northwest-1"):
-        src_fs: AbstractFileSystem = filesystem("s3", anon=True)
-        model_dir = (
-            f"/xinference-models/llm/"
-            f"{llm_family.model_name}-{llm_spec.model_format}-{llm_spec.model_size_in_billions}b"
-        )
-        return src_fs.exists(model_dir)
-
-
-def cache_from_self_hosted_storage(
-    llm_family: LLMFamilyV1,
-    llm_spec: "LLMSpecV1",
-    quantization: Optional[str] = None,
-) -> str:
-    with AWSRegion("cn-northwest-1"):
-        llm_spec = llm_spec.copy()
-        llm_spec.model_uri = (
-            f"s3://xinference-models/llm/"
-            f"{llm_family.model_name}-{llm_spec.model_format}-{llm_spec.model_size_in_billions}b"
-        )
-
-        return cache_from_uri(
-            llm_family, llm_spec, quantization, self_hosted_storage=True
-        )
-
-
 def cache_from_uri(
     llm_family: LLMFamilyV1,
     llm_spec: "LLMSpecV1",
-    quantization: Optional[str] = None,
-    self_hosted_storage: bool = False,
 ) -> str:
-    from fsspec import AbstractFileSystem, filesystem
-
-    from ..utils import copy_from_src_to_dst
-
     cache_dir_name = (
         f"{llm_family.model_name}-{llm_spec.model_format}"
         f"-{llm_spec.model_size_in_billions}b"
@@ -390,69 +340,6 @@ def cache_from_uri(
             return cache_dir
         else:
             os.symlink(src_root, cache_dir, target_is_directory=True)
-        return cache_dir
-    elif src_scheme in SUPPORTED_SCHEMES:
-        # use anonymous connection for self-hosted storage.
-        src_fs: AbstractFileSystem = filesystem(src_scheme, anon=self_hosted_storage)
-        local_fs: AbstractFileSystem = filesystem("file")
-
-        files_to_download = []
-        if llm_spec.model_format == "pytorch":
-            if os.path.exists(cache_dir):
-                logger.info(f"Cache {cache_dir} exists")
-                return cache_dir
-            else:
-                os.makedirs(cache_dir, exist_ok=True)
-
-            for path, _, files in src_fs.walk(llm_spec.model_uri):
-                for file in files:
-                    src_path = f"{path}/{file}"
-                    local_path = src_path.replace(src_root, cache_dir)
-                    files_to_download.append((src_path, local_path))
-        elif llm_spec.model_format == "ggmlv3":
-            file = llm_spec.model_file_name_template.format(quantization=quantization)
-            if os.path.exists(os.path.join(cache_dir, file)):
-                logger.info(f"Cache {os.path.join(cache_dir, file)} exists")
-                return cache_dir
-            else:
-                os.makedirs(cache_dir, exist_ok=True)
-
-            src_path = f"{src_root}/{file}"
-            local_path = f"{cache_dir}/{file}"
-            files_to_download.append((src_path, local_path))
-        else:
-            raise ValueError(f"Unsupported model format: {llm_spec.model_format}")
-
-        from concurrent.futures import ThreadPoolExecutor
-
-        failed = False
-        with ThreadPoolExecutor(max_workers=min(len(files_to_download), 4)) as executor:
-            futures = [
-                (
-                    src_path,
-                    executor.submit(
-                        copy_from_src_to_dst, src_fs, src_path, local_fs, local_path
-                    ),
-                )
-                for src_path, local_path in files_to_download
-            ]
-            for src_path, future in futures:
-                if failed:
-                    future.cancel()
-                else:
-                    try:
-                        future.result()
-                    except:
-                        logger.error(f"Download {src_path} failed", exc_info=True)
-                        failed = True
-
-        if failed:
-            logger.warning(f"Removing cache directory: {cache_dir}")
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            raise RuntimeError(
-                f"Failed to download model '{llm_family.model_name}' "
-                f"(size: {llm_spec.model_size_in_billions}, format: {llm_spec.model_format})"
-            )
         return cache_dir
     else:
         raise ValueError(f"Unsupported URL scheme: {src_scheme}")
@@ -516,25 +403,50 @@ def _get_cache_dir_for_model_mem(
 def _get_cache_dir(
     llm_family: LLMFamilyV1,
     llm_spec: "LLMSpecV1",
+    quantization: Optional[str] = None,
     create_if_not_exist=True,
 ):
     # If the model id contains quantization, then we should give each
     # quantization a dedicated cache dir.
     quant_suffix = ""
-    for q in llm_spec.quantizations:
-        if llm_spec.model_id and q in llm_spec.model_id:
-            quant_suffix = q
-            break
-    cache_dir_name = (
+    if llm_spec.model_id and "{" in llm_spec.model_id and quantization is not None:
+        quant_suffix = quantization
+    else:
+        for q in llm_spec.quantizations:
+            if llm_spec.model_id and q in llm_spec.model_id:
+                quant_suffix = q
+                break
+
+    # some model name includes ".", e.g. qwen1.5-chat
+    # if the model does not require trust_remote_code, it's OK
+    # because no need to import modeling_xxx.py from the path
+    # but when the model need to trust_remote_code,
+    # e.g. internlm2.5-chat, the import will fail,
+    # but before the model may have been downloaded,
+    # thus we check it first, if exist, return it,
+    # otherwise, we replace the "." with "_" in model name
+    old_cache_dir_name = (
         f"{llm_family.model_name}-{llm_spec.model_format}"
         f"-{llm_spec.model_size_in_billions}b"
     )
     if quant_suffix:
-        cache_dir_name += f"-{quant_suffix}"
-    cache_dir = os.path.realpath(os.path.join(XINFERENCE_CACHE_DIR, cache_dir_name))
-    if create_if_not_exist and not os.path.exists(cache_dir):
-        os.makedirs(cache_dir, exist_ok=True)
-    return cache_dir
+        old_cache_dir_name += f"-{quant_suffix}"
+    old_cache_dir = os.path.realpath(
+        os.path.join(XINFERENCE_CACHE_DIR, old_cache_dir_name)
+    )
+    if os.path.exists(old_cache_dir):
+        return old_cache_dir
+    else:
+        cache_dir_name = (
+            f"{llm_family.model_name.replace('.', '_')}-{llm_spec.model_format}"
+            f"-{llm_spec.model_size_in_billions}b"
+        )
+        if quant_suffix:
+            cache_dir_name += f"-{quant_suffix}"
+        cache_dir = os.path.realpath(os.path.join(XINFERENCE_CACHE_DIR, cache_dir_name))
+        if create_if_not_exist and not os.path.exists(cache_dir):
+            os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
 
 
 def _get_meta_path(
@@ -548,7 +460,7 @@ def _get_meta_path(
             return os.path.join(cache_dir, "__valid_download")
         else:
             return os.path.join(cache_dir, f"__valid_download_{model_hub}")
-    elif model_format in ["ggmlv3", "ggufv2", "gptq", "awq"]:
+    elif model_format in ["ggufv2", "gptq", "awq", "fp8", "mlx"]:
         assert quantization is not None
         if model_hub == "huggingface":
             return os.path.join(cache_dir, f"__valid_download_{quantization}")
@@ -567,13 +479,16 @@ def _skip_download(
     model_revision: Optional[str],
     quantization: Optional[str] = None,
 ) -> bool:
-    if model_format == "pytorch":
+    if model_format in ["pytorch", "mindspore"]:
         model_hub_to_meta_path = {
             "huggingface": _get_meta_path(
                 cache_dir, model_format, "huggingface", quantization
             ),
             "modelscope": _get_meta_path(
                 cache_dir, model_format, "modelscope", quantization
+            ),
+            "openmind_hub": _get_meta_path(
+                cache_dir, model_format, "openmind_hub", quantization
             ),
             "csghub": _get_meta_path(cache_dir, model_format, "csghub", quantization),
         }
@@ -587,7 +502,7 @@ def _skip_download(
                     logger.warning(f"Cache {cache_dir} exists, but it was from {hub}")
                     return True
             return False
-    elif model_format in ["ggmlv3", "ggufv2", "gptq", "awq"]:
+    elif model_format in ["ggufv2", "gptq", "awq", "fp8", "mlx"]:
         assert quantization is not None
         return os.path.exists(
             _get_meta_path(cache_dir, model_format, model_hub, quantization)
@@ -650,12 +565,12 @@ def _generate_model_file_names(
 def _merge_cached_files(
     cache_dir: str, input_file_names: List[str], output_file_name: str
 ):
-    with open(os.path.join(cache_dir, output_file_name), "wb") as output_file:
-        for file_name in input_file_names:
-            logger.info(f"Merging file {file_name} into {output_file_name} ...")
-
-            with open(os.path.join(cache_dir, file_name), "rb") as input_file:
-                shutil.copyfileobj(input_file, output_file)
+    # now llama.cpp can find the gguf parts automatically
+    # we only need to provide the first part
+    # thus we create the symlink to the first part
+    symlink_local_file(
+        os.path.join(cache_dir, input_file_names[0]), cache_dir, output_file_name
+    )
 
     logger.info(f"Merge complete.")
 
@@ -682,7 +597,7 @@ def cache_from_csghub(
     ):
         return cache_dir
 
-    if llm_spec.model_format in ["pytorch", "gptq", "awq"]:
+    if llm_spec.model_format in ["pytorch", "gptq", "awq", "fp8", "mlx"]:
         download_dir = retry_download(
             snapshot_download,
             llm_family.model_name,
@@ -691,12 +606,12 @@ def cache_from_csghub(
                 "model_format": llm_spec.model_format,
             },
             llm_spec.model_id,
-            endpoint="https://hub-stg.opencsg.com",
+            endpoint=XINFERENCE_CSG_ENDPOINT,
             token=os.environ.get(XINFERENCE_ENV_CSG_TOKEN),
         )
         create_symlink(download_dir, cache_dir)
 
-    elif llm_spec.model_format in ["ggmlv3", "ggufv2"]:
+    elif llm_spec.model_format in ["ggufv2"]:
         file_names, final_file_name, need_merge = _generate_model_file_names(
             llm_spec, quantization
         )
@@ -711,7 +626,7 @@ def cache_from_csghub(
                 },
                 llm_spec.model_id,
                 file_name=filename,
-                endpoint="https://hub-stg.opencsg.com",
+                endpoint=XINFERENCE_CSG_ENDPOINT,
                 token=os.environ.get(XINFERENCE_ENV_CSG_TOKEN),
             )
             symlink_local_file(download_path, cache_dir, filename)
@@ -750,7 +665,7 @@ def cache_from_modelscope(
     ):
         return cache_dir
 
-    if llm_spec.model_format in ["pytorch", "gptq", "awq"]:
+    if llm_spec.model_format in ["pytorch", "gptq", "awq", "fp8", "mlx"]:
         download_dir = retry_download(
             snapshot_download,
             llm_family.model_name,
@@ -763,7 +678,7 @@ def cache_from_modelscope(
         )
         create_symlink(download_dir, cache_dir)
 
-    elif llm_spec.model_format in ["ggmlv3", "ggufv2"]:
+    elif llm_spec.model_format in ["ggufv2"]:
         file_names, final_file_name, need_merge = _generate_model_file_names(
             llm_spec, quantization
         )
@@ -784,6 +699,50 @@ def cache_from_modelscope(
 
         if need_merge:
             _merge_cached_files(cache_dir, file_names, final_file_name)
+    else:
+        raise ValueError(f"Unsupported format: {llm_spec.model_format}")
+
+    meta_path = _get_meta_path(
+        cache_dir, llm_spec.model_format, llm_spec.model_hub, quantization
+    )
+    _generate_meta_file(meta_path, llm_family, llm_spec, quantization)
+
+    return cache_dir
+
+
+def cache_from_openmind_hub(
+    llm_family: LLMFamilyV1,
+    llm_spec: "LLMSpecV1",
+    quantization: Optional[str] = None,
+) -> str:
+    """
+    Cache model from openmind_hub. Return the cache directory.
+    """
+    from openmind_hub import snapshot_download
+
+    cache_dir = _get_cache_dir(llm_family, llm_spec)
+    if _skip_download(
+        cache_dir,
+        llm_spec.model_format,
+        llm_spec.model_hub,
+        llm_spec.model_revision,
+        quantization,
+    ):
+        return cache_dir
+
+    if llm_spec.model_format in ["pytorch", "mindspore"]:
+        download_dir = retry_download(
+            snapshot_download,
+            llm_family.model_name,
+            {
+                "model_size": llm_spec.model_size_in_billions,
+                "model_format": llm_spec.model_format,
+            },
+            llm_spec.model_id,
+            revision=llm_spec.model_revision,
+        )
+        create_symlink(download_dir, cache_dir)
+
     else:
         raise ValueError(f"Unsupported format: {llm_spec.model_format}")
 
@@ -819,8 +778,8 @@ def cache_from_huggingface(
     if not IS_NEW_HUGGINGFACE_HUB:
         use_symlinks = {"local_dir_use_symlinks": True, "local_dir": cache_dir}
 
-    if llm_spec.model_format in ["pytorch", "gptq", "awq"]:
-        assert isinstance(llm_spec, PytorchLLMSpecV1)
+    if llm_spec.model_format in ["pytorch", "gptq", "awq", "fp8", "mlx"]:
+        assert isinstance(llm_spec, (PytorchLLMSpecV1, MLXLLMSpecV1))
         download_dir = retry_download(
             huggingface_hub.snapshot_download,
             llm_family.model_name,
@@ -835,8 +794,8 @@ def cache_from_huggingface(
         if IS_NEW_HUGGINGFACE_HUB:
             create_symlink(download_dir, cache_dir)
 
-    elif llm_spec.model_format in ["ggmlv3", "ggufv2"]:
-        assert isinstance(llm_spec, GgmlLLMSpecV1)
+    elif llm_spec.model_format in ["ggufv2"]:
+        assert isinstance(llm_spec, LlamaCppLLMSpecV1)
         file_names, final_file_name, need_merge = _generate_model_file_names(
             llm_spec, quantization
         )
@@ -875,6 +834,7 @@ def _check_revision(
     llm_spec: "LLMSpecV1",
     builtin: list,
     meta_path: str,
+    quantization: Optional[str] = None,
 ) -> bool:
     for family in builtin:
         if llm_family.model_name == family.model_name:
@@ -883,59 +843,63 @@ def _check_revision(
                 if (
                     spec.model_format == "pytorch"
                     and spec.model_size_in_billions == llm_spec.model_size_in_billions
+                    and (quantization is None or quantization in spec.quantizations)
                 ):
                     return valid_model_revision(meta_path, spec.model_revision)
     return False
 
 
 def get_cache_status(
-    llm_family: LLMFamilyV1,
-    llm_spec: "LLMSpecV1",
+    llm_family: LLMFamilyV1, llm_spec: "LLMSpecV1", quantization: Optional[str] = None
 ) -> Union[bool, List[bool]]:
     """
-    When calling this function from above, `llm_family` is constructed only from BUILTIN_LLM_FAMILIES,
-    so we should check both huggingface and modelscope cache files.
+    Checks if a model's cache status is available based on the model format and quantization.
+    Supports different directories and model formats.
     """
-    cache_dir = _get_cache_dir(llm_family, llm_spec, create_if_not_exist=False)
-    # check revision for pytorch model
-    if llm_spec.model_format == "pytorch":
-        hf_meta_path = _get_meta_path(cache_dir, "pytorch", "huggingface", "none")
-        ms_meta_path = _get_meta_path(cache_dir, "pytorch", "modelscope", "none")
-        revisions = [
-            _check_revision(llm_family, llm_spec, BUILTIN_LLM_FAMILIES, hf_meta_path),
-            _check_revision(
-                llm_family, llm_spec, BUILTIN_MODELSCOPE_LLM_FAMILIES, ms_meta_path
+
+    def check_file_status(meta_path: str) -> bool:
+        return os.path.exists(meta_path)
+
+    def check_revision_status(
+        meta_path: str, families: list, quantization: Optional[str] = None
+    ) -> bool:
+        return _check_revision(llm_family, llm_spec, families, meta_path, quantization)
+
+    def handle_quantization(q: Union[str, None]) -> bool:
+        specific_cache_dir = _get_cache_dir(
+            llm_family, llm_spec, q, create_if_not_exist=False
+        )
+        meta_paths = {
+            "huggingface": _get_meta_path(
+                specific_cache_dir, llm_spec.model_format, "huggingface", q
             ),
-        ]
-        return any(revisions)
-    # just check meta file for ggml and gptq model
-    elif llm_spec.model_format in ["ggmlv3", "ggufv2", "gptq", "awq"]:
-        ret = []
-        for q in llm_spec.quantizations:
-            assert q is not None
-            hf_meta_path = _get_meta_path(
-                cache_dir, llm_spec.model_format, "huggingface", q
+            "modelscope": _get_meta_path(
+                specific_cache_dir, llm_spec.model_format, "modelscope", q
+            ),
+        }
+        if llm_spec.model_format == "pytorch":
+            return check_revision_status(
+                meta_paths["huggingface"], BUILTIN_LLM_FAMILIES, q
+            ) or check_revision_status(
+                meta_paths["modelscope"], BUILTIN_MODELSCOPE_LLM_FAMILIES, q
             )
-            ms_meta_path = _get_meta_path(
-                cache_dir, llm_spec.model_format, "modelscope", q
+        else:
+            return check_file_status(meta_paths["huggingface"]) or check_file_status(
+                meta_paths["modelscope"]
             )
-            results = [os.path.exists(hf_meta_path), os.path.exists(ms_meta_path)]
-            ret.append(any(results))
-        return ret
+
+    if llm_spec.model_id and "{" in llm_spec.model_id:
+        return (
+            [handle_quantization(q) for q in llm_spec.quantizations]
+            if quantization is None
+            else handle_quantization(quantization)
+        )
     else:
-        raise ValueError(f"Unsupported model format: {llm_spec.model_format}")
-
-
-def _is_linux():
-    return platform.system() == "Linux"
-
-
-def _has_cuda_device():
-    # `cuda_count` method already contains the logic for the
-    # number of GPUs specified by `CUDA_VISIBLE_DEVICES`.
-    from ...utils import cuda_count
-
-    return cuda_count() > 0
+        return (
+            [handle_quantization(q) for q in llm_spec.quantizations]
+            if llm_spec.model_format != "pytorch"
+            else handle_quantization(None)
+        )
 
 
 def get_user_defined_llm_families():
@@ -981,6 +945,9 @@ def match_llm(
     model_format: Optional[str] = None,
     model_size_in_billions: Optional[Union[int, str]] = None,
     quantization: Optional[str] = None,
+    download_hub: Optional[
+        Literal["huggingface", "modelscope", "openmind_hub", "csghub"]
+    ] = None,
 ) -> Optional[Tuple[LLMFamilyV1, LLMSpecV1, str]]:
     """
     Find an LLM family, spec, and quantization that satisfy given criteria.
@@ -1004,9 +971,36 @@ def match_llm(
             spec.model_id = spec.model_id.format(quantization=q)
         return spec
 
-    if download_from_modelscope():
+    # priority: download_hub > download_from_modelscope() and download_from_csghub()
+    if download_hub == "modelscope":
         all_families = (
             BUILTIN_MODELSCOPE_LLM_FAMILIES
+            + BUILTIN_LLM_FAMILIES
+            + user_defined_llm_families
+        )
+    elif download_hub == "openmind_hub":
+        all_families = (
+            BUILTIN_OPENMIND_HUB_LLM_FAMILIES
+            + BUILTIN_LLM_FAMILIES
+            + user_defined_llm_families
+        )
+    elif download_hub == "csghub":
+        all_families = (
+            BUILTIN_CSGHUB_LLM_FAMILIES
+            + BUILTIN_LLM_FAMILIES
+            + user_defined_llm_families
+        )
+    elif download_hub == "huggingface":
+        all_families = BUILTIN_LLM_FAMILIES + user_defined_llm_families
+    elif download_from_modelscope():
+        all_families = (
+            BUILTIN_MODELSCOPE_LLM_FAMILIES
+            + BUILTIN_LLM_FAMILIES
+            + user_defined_llm_families
+        )
+    elif download_from_openmind_hub():
+        all_families = (
+            BUILTIN_OPENMIND_HUB_LLM_FAMILIES
             + BUILTIN_LLM_FAMILIES
             + user_defined_llm_families
         )
@@ -1057,6 +1051,11 @@ def register_llm(llm_family: LLMFamilyV1, persist: bool):
     if not is_valid_model_name(llm_family.model_name):
         raise ValueError(f"Invalid model name {llm_family.model_name}.")
 
+    for spec in llm_family.model_specs:
+        model_uri = spec.model_uri
+        if model_uri and not is_valid_model_uri(model_uri):
+            raise ValueError(f"Invalid model URI {model_uri}.")
+
     with UD_LLM_FAMILIES_LOCK:
         for family in BUILTIN_LLM_FAMILIES + UD_LLM_FAMILIES:
             if llm_family.model_name == family.model_name:
@@ -1068,12 +1067,6 @@ def register_llm(llm_family: LLMFamilyV1, persist: bool):
         generate_engine_config_by_model_family(llm_family)
 
     if persist:
-        # We only validate model URL when persist is True.
-        for spec in llm_family.model_specs:
-            model_uri = spec.model_uri
-            if model_uri and not is_valid_model_uri(model_uri):
-                raise ValueError(f"Invalid model URI {model_uri}.")
-
         persist_path = os.path.join(
             XINFERENCE_MODEL_DIR, "llm", f"{llm_family.model_name}.json"
         )

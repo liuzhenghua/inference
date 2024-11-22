@@ -20,7 +20,7 @@ import platform
 from abc import abstractmethod
 from collections import defaultdict
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
 
 from ...core.utils import parse_replica_model_uid
 from ...types import PeftModelConfig
@@ -52,9 +52,7 @@ class LLM(abc.ABC):
         *args,
         **kwargs,
     ):
-        self.model_uid, self.replica, self.rep_id = parse_replica_model_uid(
-            replica_model_uid
-        )
+        self.model_uid, self.rep_id = parse_replica_model_uid(replica_model_uid)
         self.model_family = model_family
         self.model_spec = model_spec
         self.quantization = quantization
@@ -193,6 +191,10 @@ def create_llm_model_instance(
     model_size_in_billions: Optional[Union[int, str]] = None,
     quantization: Optional[str] = None,
     peft_model_config: Optional[PeftModelConfig] = None,
+    download_hub: Optional[
+        Literal["huggingface", "modelscope", "openmind_hub", "csghub"]
+    ] = None,
+    model_path: Optional[str] = None,
     **kwargs,
 ) -> Tuple[LLM, LLMDescription]:
     from .llm_family import cache, check_engine_by_spec_parameters, match_llm
@@ -200,7 +202,7 @@ def create_llm_model_instance(
     if model_engine is None:
         raise ValueError("model_engine is required for LLM model")
     match_result = match_llm(
-        model_name, model_format, model_size_in_billions, quantization
+        model_name, model_format, model_size_in_billions, quantization, download_hub
     )
 
     if not match_result:
@@ -220,7 +222,8 @@ def create_llm_model_instance(
     )
     logger.debug(f"Launching {model_uid} with {llm_cls.__name__}")
 
-    save_path = cache(llm_family, llm_spec, quantization)
+    if not model_path:
+        model_path = cache(llm_family, llm_spec, quantization)
 
     peft_model = peft_model_config.peft_model if peft_model_config else None
     if peft_model is not None:
@@ -230,7 +233,7 @@ def create_llm_model_instance(
                 llm_family,
                 llm_spec,
                 quantization,
-                save_path,
+                model_path,
                 kwargs,
                 peft_model,
             )
@@ -240,11 +243,11 @@ def create_llm_model_instance(
                 f"Load this without lora."
             )
             model = llm_cls(
-                model_uid, llm_family, llm_spec, quantization, save_path, kwargs
+                model_uid, llm_family, llm_spec, quantization, model_path, kwargs
             )
     else:
         model = llm_cls(
-            model_uid, llm_family, llm_spec, quantization, save_path, kwargs
+            model_uid, llm_family, llm_spec, quantization, model_path, kwargs
         )
     return model, LLMDescription(
         subpool_addr, devices, llm_family, llm_spec, quantization

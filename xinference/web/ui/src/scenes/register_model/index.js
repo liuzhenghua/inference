@@ -6,34 +6,43 @@ import { useNavigate } from 'react-router-dom'
 
 import ErrorMessageSnackBar from '../../components/errorMessageSnackBar'
 import Title from '../../components/Title'
+import { isValidBearerToken } from '../../components/utils'
 import RegisterModelComponent from './registerModel'
 
 const RegisterModel = () => {
-  const [tabValue, setTabValue] = React.useState('/register_model/llm')
+  const [tabValue, setTabValue] = React.useState(
+    sessionStorage.getItem('registerModelType')
+      ? sessionStorage.getItem('registerModelType')
+      : '/register_model/llm'
+  )
   const [cookie] = useCookies(['token'])
   const navigate = useNavigate()
 
   useEffect(() => {
-    if (cookie.token === '' || cookie.token === undefined) {
-      return
-    }
-    if (cookie.token !== 'no_auth' && !sessionStorage.getItem('token')) {
+    if (
+      sessionStorage.getItem('auth') === 'true' &&
+      !isValidBearerToken(sessionStorage.getItem('token')) &&
+      !isValidBearerToken(cookie.token)
+    ) {
       navigate('/login', { replace: true })
-      return
     }
   }, [cookie.token])
 
+  const handleTabChange = (_, newValue) => {
+    setTabValue(newValue)
+    navigate(newValue)
+    sessionStorage.setItem('registerModelType', newValue)
+  }
+
   return (
-    <Box m="20px">
+    <Box m="20px" style={{ overflow: 'hidden' }}>
       <Title title="Register Model" />
       <ErrorMessageSnackBar />
       <TabContext value={tabValue}>
         <Box sx={{ borderBottom: 1, borderColor: 'divider' }}>
           <TabList
             value={tabValue}
-            onChange={(e, v) => {
-              setTabValue(v)
-            }}
+            onChange={handleTabChange}
             aria-label="tabs"
           >
             <Tab label="Language Model" value="/register_model/llm" />
@@ -41,6 +50,7 @@ const RegisterModel = () => {
             <Tab label="Rerank Model" value="/register_model/rerank" />
             <Tab label="Image Model" value="/register_model/image" />
             <Tab label="Audio Model" value="/register_model/audio" />
+            <Tab label="Flexible Model" value="/register_model/flexible" />
           </TabList>
         </Box>
         <TabPanel value="/register_model/llm" sx={{ padding: 0 }}>
@@ -53,16 +63,15 @@ const RegisterModel = () => {
               context_length: 2048,
               model_lang: ['en'],
               model_ability: ['generate'],
-              model_family: '',
               model_specs: [
                 {
-                  model_uri: '/path/to/llama-2',
+                  model_uri: '/path/to/llama-1',
                   model_size_in_billions: 7,
                   model_format: 'pytorch',
                   quantizations: ['none'],
                 },
               ],
-              prompt_style: undefined,
+              model_family: 'your_custom_model',
             }}
           />
         </TabPanel>
@@ -107,6 +116,18 @@ const RegisterModel = () => {
               model_uri: '/path/to/audio-model',
               multilingual: false,
               model_family: 'whisper',
+            }}
+          />
+        </TabPanel>
+        <TabPanel value="/register_model/flexible" sx={{ padding: 0 }}>
+          <RegisterModelComponent
+            modelType="flexible"
+            customData={{
+              model_name: 'flexible-model',
+              model_description: 'This is a model description.',
+              model_uri: '/path/to/model',
+              launcher: 'xinference.model.flexible.launchers.transformers',
+              launcher_args: '{}',
             }}
           />
         </TabPanel>

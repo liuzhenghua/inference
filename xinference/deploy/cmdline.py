@@ -17,7 +17,7 @@ import logging
 import os
 import sys
 import warnings
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import click
 from xoscar.utils import get_next_port
@@ -25,7 +25,6 @@ from xoscar.utils import get_next_port
 from .. import __version__
 from ..client import RESTfulClient
 from ..client.restful.restful_client import (
-    RESTfulChatglmCppChatModelHandle,
     RESTfulChatModelHandle,
     RESTfulGenerateModelHandle,
 )
@@ -39,12 +38,12 @@ from ..constants import (
     XINFERENCE_LOG_MAX_BYTES,
 )
 from ..isolation import Isolation
-from ..types import ChatCompletionMessage
 from .utils import (
     get_config_dict,
     get_log_file,
     get_timestamp_ms,
     handle_click_args_type,
+    set_envs,
 )
 
 try:
@@ -108,6 +107,8 @@ def start_local_cluster(
         XINFERENCE_LOG_MAX_BYTES,
     )
     logging.config.dictConfig(dict_config)  # type: ignore
+    # refer to https://huggingface.co/docs/transformers/main_classes/logging
+    set_envs("TRANSFORMERS_VERBOSITY", log_level.lower())
 
     main(
         host=host,
@@ -282,6 +283,7 @@ def supervisor(
         XINFERENCE_LOG_MAX_BYTES,
     )
     logging.config.dictConfig(dict_config)  # type: ignore
+    set_envs("TRANSFORMERS_VERBOSITY", log_level.lower())
 
     main(
         host=host,
@@ -344,6 +346,7 @@ def worker(
         XINFERENCE_LOG_MAX_BYTES,
     )
     logging.config.dictConfig(dict_config)  # type: ignore
+    set_envs("TRANSFORMERS_VERBOSITY", log_level.lower())
 
     endpoint = get_endpoint(endpoint)
 
@@ -371,6 +374,9 @@ def worker(
 )
 @click.option("--file", "-f", type=str, help="Path to the model configuration file.")
 @click.option(
+    "--worker-ip", "-w", type=str, help="Specify the ip address of the worker."
+)
+@click.option(
     "--persist",
     "-p",
     is_flag=True,
@@ -387,6 +393,7 @@ def register_model(
     endpoint: Optional[str],
     model_type: str,
     file: str,
+    worker_ip: str,
     persist: bool,
     api_key: Optional[str],
 ):
@@ -400,6 +407,7 @@ def register_model(
     client.register_model(
         model_type=model_type,
         model=model,
+        worker_ip=worker_ip,
         persist=persist,
     )
 
@@ -746,7 +754,7 @@ def remove_cache(
     "-f",
     default=None,
     type=str,
-    help="Specify the format of the model, e.g. pytorch, ggmlv3, etc.",
+    help="Specify the format of the model, e.g. pytorch, ggufv2, etc.",
 )
 @click.option(
     "--quantization",
@@ -1206,13 +1214,12 @@ def model_chat(
     stream: bool,
     api_key: Optional[str],
 ):
-    # TODO: chat model roles may not be user and assistant.
     endpoint = get_endpoint(endpoint)
     client = RESTfulClient(base_url=endpoint, api_key=api_key)
     if api_key is None:
         client._set_token(get_stored_token(endpoint, client))
 
-    chat_history: "List[ChatCompletionMessage]" = []
+    messages: List[Dict] = []
     if stream:
         # TODO: when stream=True, RestfulClient cannot generate words one by one.
         # So use Client in temporary. The implementation needs to be changed to
@@ -1225,10 +1232,10 @@ def model_chat(
                 if prompt == "":
                     break
                 print("Assistant: ", end="", file=sys.stdout)
+                messages.append(dict(role="user", content=prompt))
                 response_content = ""
                 for chunk in model.chat(
-                    prompt=prompt,
-                    chat_history=chat_history,
+                    messages,
                     generate_config={"stream": stream, "max_tokens": max_tokens},
                 ):
                     delta = chunk["choices"][0]["delta"]
@@ -1238,10 +1245,7 @@ def model_chat(
                         response_content += delta["content"]
                         print(delta["content"], end="", flush=True, file=sys.stdout)
                 print("", file=sys.stdout)
-                chat_history.append(ChatCompletionMessage(role="user", content=prompt))
-                chat_history.append(
-                    ChatCompletionMessage(role="assistant", content=response_content)
-                )
+                messages.append(dict(role="assistant", content=response_content))
 
         model = client.get_model(model_uid=model_uid)
 
@@ -1263,29 +1267,24 @@ def model_chat(
                 task.exception()
     else:
         restful_model = client.get_model(model_uid=model_uid)
-        if not isinstance(
-            restful_model, (RESTfulChatModelHandle, RESTfulChatglmCppChatModelHandle)
-        ):
+        if not isinstance(restful_model, RESTfulChatModelHandle):
             raise ValueError(f"model {model_uid} has no chat method")
 
         while True:
             prompt = input("User: ")
             if prompt == "":
                 break
-            chat_history.append(ChatCompletionMessage(role="user", content=prompt))
+            messages.append({"role": "user", "content": prompt})
             print("Assistant: ", end="", file=sys.stdout)
             response = restful_model.chat(
-                prompt=prompt,
-                chat_history=chat_history,
+                messages,
                 generate_config={"stream": stream, "max_tokens": max_tokens},
             )
             if not isinstance(response, dict):
                 raise ValueError("chat result is not valid")
             response_content = response["choices"][0]["message"]["content"]
             print(f"{response_content}\n", file=sys.stdout)
-            chat_history.append(
-                ChatCompletionMessage(role="assistant", content=response_content)
-            )
+            messages.append(dict(role="assistant", content=response_content))
 
 
 @cli.command("vllm-models", help="Query and display models compatible with vLLM.")
@@ -1514,7 +1513,7 @@ def query_engine_by_model_name(
     "-f",
     type=str,
     required=True,
-    help="Specify the format of the model, e.g. pytorch, ggmlv3, etc.",
+    help="Specify the format of the model, e.g. pytorch, ggufv2, etc.",
 )
 @click.option(
     "--quantization",
@@ -1576,6 +1575,52 @@ def cal_model_mem(
     print("  overhead: %d MB" % (mem_info.overhead))
     print("  active: %d MB" % (mem_info.activation_mem))
     print("  total: %d MB (%d GB)" % (mem_info.total, total_mem_g))
+
+
+@cli.command(
+    "stop-cluster",
+    help="Stop a cluster using the Xinference framework with the given parameters.",
+)
+@click.option(
+    "--endpoint",
+    "-e",
+    type=str,
+    required=True,
+    help="Xinference endpoint.",
+)
+@click.option(
+    "--api-key",
+    "-ak",
+    default=None,
+    type=str,
+    help="API key for accessing the Xinference API with authorization.",
+)
+@click.option("--check", is_flag=True, help="Confirm the deletion of the cache.")
+def stop_cluster(endpoint: str, api_key: Optional[str], check: bool):
+    endpoint = get_endpoint(endpoint)
+    client = RESTfulClient(base_url=endpoint, api_key=api_key)
+    if api_key is None:
+        client._set_token(get_stored_token(endpoint, client))
+
+    if not check:
+        click.echo(
+            f"This command will stop Xinference cluster in {endpoint}.", err=True
+        )
+        supervisor_info = client.get_supervisor_info()
+        click.echo("Supervisor information: ")
+        click.echo(supervisor_info)
+
+        workers_info = client.get_workers_info()
+        click.echo("Workers information:")
+        click.echo(workers_info)
+
+        click.confirm("Continue?", abort=True)
+    try:
+        result = client.abort_cluster()
+        result = result.get("result")
+        click.echo(f"Cluster stopped: {result}")
+    except Exception as e:
+        click.echo(e)
 
 
 if __name__ == "__main__":

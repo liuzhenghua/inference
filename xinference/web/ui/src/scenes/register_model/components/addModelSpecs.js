@@ -14,25 +14,73 @@ import React, { useEffect, useState } from 'react'
 
 const modelFormatArr = [
   { value: 'pytorch', label: 'PyTorch' },
-  { value: 'ggmlv3', label: 'GGML' },
   { value: 'ggufv2', label: 'GGUF' },
   { value: 'gptq', label: 'GPTQ' },
   { value: 'awq', label: 'AWQ' },
+  { value: 'fp8', label: 'FP8' },
+  { value: 'mlx', label: 'MLX' },
 ]
 
-const AddModelSpecs = ({ formData, onGetArr, scrollRef }) => {
-  const [count, setCount] = useState(1)
-  const [specsArr, setSpecsArr] = useState([
-    {
-      id: 0,
-      ...formData,
-    },
-  ])
-  const [path, setPath] = useState('/path/to/llama-2')
+const AddModelSpecs = ({
+  isJump,
+  formData,
+  specsDataArr,
+  onGetArr,
+  scrollRef,
+}) => {
+  const [count, setCount] = useState(0)
+  const [specsArr, setSpecsArr] = useState([])
+  const [pathArr, setPathArr] = useState([])
   const [modelSizeAlertId, setModelSizeAlertId] = useState([])
   const [quantizationAlertId, setQuantizationAlertId] = useState([])
   const [isError, setIsError] = useState(false)
-  const [arrLength, setArrLength] = useState(1)
+  const [isAdd, setIsAdd] = useState(false)
+
+  useEffect(() => {
+    if (isJump) {
+      const dataArr = specsDataArr.map((item, index) => {
+        const {
+          model_uri,
+          model_size_in_billions,
+          model_format,
+          quantizations,
+          model_file_name_template,
+        } = item
+        let size = model_size_in_billions
+        if (typeof size !== 'number') size = size.split('_').join('.')
+
+        return {
+          id: index,
+          model_uri,
+          model_size_in_billions: size,
+          model_format,
+          quantizations,
+          model_file_name_template,
+        }
+      })
+      setCount(dataArr.length)
+      setSpecsArr(dataArr)
+
+      const subPathArr = []
+      specsDataArr.forEach((item) => {
+        if (item.model_format !== 'ggufv2') {
+          subPathArr.push(item.model_uri)
+        } else {
+          subPathArr.push(item.model_uri + '/' + item.model_file_name_template)
+        }
+      })
+      setPathArr(subPathArr)
+    } else {
+      setSpecsArr([
+        {
+          id: count,
+          ...formData,
+        },
+      ])
+      setCount(count + 1)
+      setPathArr([formData.model_uri])
+    }
+  }, [])
 
   useEffect(() => {
     const arr = specsArr.map((item) => {
@@ -51,10 +99,7 @@ const AddModelSpecs = ({ formData, onGetArr, scrollRef }) => {
       let handleQuantization = quantizations
       if (modelFormat === 'pytorch') {
         handleQuantization = ['none']
-      } else if (
-        handleQuantization[0] === '' &&
-        (modelFormat === 'ggmlv3' || modelFormat === 'ggufv2')
-      ) {
+      } else if (handleQuantization[0] === '' && modelFormat === 'ggufv2') {
         handleQuantization = ['default']
       }
 
@@ -71,31 +116,46 @@ const AddModelSpecs = ({ formData, onGetArr, scrollRef }) => {
       setIsError(false)
     }
     onGetArr(arr, isError)
-    setArrLength(specsArr.length)
-    arrLength < specsArr.length ? handleScrollBottom() : ''
+    isAdd && handleScrollBottom()
+    setIsAdd(false)
   }, [specsArr, isError])
 
   const handleAddSpecs = () => {
     setCount(count + 1)
     const item = {
       id: count,
-      model_uri: '/path/to/llama-2',
+      model_uri: '/path/to/llama-1',
       model_size_in_billions: 7,
       model_format: 'pytorch',
       quantizations: [],
     }
     setSpecsArr([...specsArr, item])
+    setIsAdd(true)
+    setPathArr([...pathArr, '/path/to/llama-1'])
   }
 
   const handleUpdateSpecsArr = (index, type, newValue) => {
+    if (type === 'model_format') {
+      const subPathArr = [...pathArr]
+      if (specsArr[index].model_format !== 'ggufv2') {
+        pathArr[index] = specsArr[index].model_uri
+      } else {
+        pathArr[index] =
+          specsArr[index].model_uri +
+          '/' +
+          specsArr[index].model_file_name_template
+      }
+      setPathArr(subPathArr)
+    }
+
     setSpecsArr(
       specsArr.map((item, subIndex) => {
         if (subIndex === index) {
           if (type === 'quantizations') {
             return { ...item, [type]: [newValue] }
           } else if (type === 'model_format') {
-            if (newValue === 'ggmlv3' || newValue === 'ggufv2') {
-              const { baseDir, filename } = getPathComponents(path)
+            if (newValue === 'ggufv2') {
+              const { baseDir, filename } = getPathComponents(pathArr[index])
               const obj = {
                 ...item,
                 model_format: newValue,
@@ -108,7 +168,7 @@ const AddModelSpecs = ({ formData, onGetArr, scrollRef }) => {
               const { id, model_size_in_billions, model_format } = item
               return {
                 id,
-                model_uri: path,
+                model_uri: pathArr[index],
                 model_size_in_billions,
                 model_format,
                 [type]: newValue,
@@ -116,11 +176,10 @@ const AddModelSpecs = ({ formData, onGetArr, scrollRef }) => {
               }
             }
           } else if (type === 'model_uri') {
-            setPath(newValue)
-            if (
-              item.model_format === 'ggmlv3' ||
-              item.model_format === 'ggufv2'
-            ) {
+            const subPathArr = [...pathArr]
+            subPathArr[index] = newValue
+            setPathArr(subPathArr)
+            if (item.model_format === 'ggufv2') {
               const { baseDir, filename } = getPathComponents(newValue)
               const obj = {
                 ...item,
@@ -165,7 +224,13 @@ const AddModelSpecs = ({ formData, onGetArr, scrollRef }) => {
   const handleQuantization = (model_format, index, value, id) => {
     setQuantizationAlertId(quantizationAlertId.filter((item) => item !== id))
     handleUpdateSpecsArr(index, 'quantizations', value)
-    if ((model_format === 'gptq' || model_format === 'awq') && value === '') {
+    if (
+      (model_format === 'gptq' ||
+        model_format === 'awq' ||
+        model_format === 'fp8' ||
+        model_format === 'mlx') &&
+      value === ''
+    ) {
       const quantizationAlertIdArr = Array.from(
         new Set([...quantizationAlertId, id])
       )
@@ -182,8 +247,8 @@ const AddModelSpecs = ({ formData, onGetArr, scrollRef }) => {
 
   return (
     <>
-      <div>
-        <label style={{ marginBottom: '20px' }}>Model Specs</label>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 10 }}>
+        <label style={{ width: '100px' }}>Model Specs</label>
         <Button
           variant="contained"
           size="small"
@@ -208,11 +273,18 @@ const AddModelSpecs = ({ formData, onGetArr, scrollRef }) => {
               value={item.model_format}
               onChange={(e) => {
                 handleUpdateSpecsArr(index, 'model_format', e.target.value)
-                if (e.target.value === 'gptq' || e.target.value === 'awq') {
+                if (
+                  e.target.value === 'gptq' ||
+                  e.target.value === 'awq' ||
+                  e.target.value === 'fp8' ||
+                  e.target.value === 'mlx'
+                ) {
                   const quantizationAlertIdArr = Array.from(
                     new Set([...quantizationAlertId, item.id])
                   )
                   setQuantizationAlertId(quantizationAlertIdArr)
+                } else {
+                  setQuantizationAlertId([])
                 }
               }}
             >
@@ -235,11 +307,15 @@ const AddModelSpecs = ({ formData, onGetArr, scrollRef }) => {
               style={{ minWidth: '60%' }}
               label="Model Path"
               size="small"
-              value={path}
+              value={
+                item.model_format !== 'ggufv2'
+                  ? item.model_uri
+                  : item.model_uri + '/' + item.model_file_name_template
+              }
               onChange={(e) => {
                 handleUpdateSpecsArr(index, 'model_uri', e.target.value)
               }}
-              helperText="For PyTorch, provide the model directory. For GGML/GGUF, provide the model file path."
+              helperText="For PyTorch, provide the model directory. For GGUF, provide the model file path."
             />
             <Box padding="15px"></Box>
 
@@ -264,7 +340,10 @@ const AddModelSpecs = ({ formData, onGetArr, scrollRef }) => {
                 <TextField
                   style={{ minWidth: '60%' }}
                   label={
-                    item.model_format === 'gptq' || item.model_format === 'awq'
+                    item.model_format === 'gptq' ||
+                    item.model_format === 'awq' ||
+                    item.model_format === 'fp8' ||
+                    item.model_format === 'mlx'
                       ? 'Quantization'
                       : 'Quantization (Optional)'
                   }
@@ -279,13 +358,15 @@ const AddModelSpecs = ({ formData, onGetArr, scrollRef }) => {
                     )
                   }}
                   helperText={
-                    item.model_format === 'gptq' || item.model_format === 'awq'
-                      ? 'For GPTQ/AWQ models, please be careful to fill in the quantization corresponding to the model you want to register.'
+                    item.model_format === 'gptq' ||
+                    item.model_format === 'awq' ||
+                    item.model_format === 'fp8' ||
+                    item.model_format === 'mlx'
+                      ? 'For GPTQ/AWQ/FP8/MLX models, please be careful to fill in the quantization corresponding to the model you want to register.'
                       : ''
                   }
                 />
-                {item.model_format !== 'ggmlv3' &&
-                  item.model_format !== 'ggufv2' &&
+                {item.model_format !== 'ggufv2' &&
                   quantizationAlertId.includes(item.id) &&
                   item.quantizations[0] == '' && (
                     <Alert severity="error">
